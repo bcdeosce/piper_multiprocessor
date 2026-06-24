@@ -36,26 +36,23 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Número de workers (ajustável via env) ----------
+# ---------- Workers ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 10))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
 logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
 
-# ---------- Função de inicialização dos workers TTS ----------
+# ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
-    """Inicializa o cache de vozes no processo worker."""
     ort.set_default_logger_severity(3)
-    # Obtém o nome do módulo atual (robusto contra spawn)
     current_module = inspect.getmodule(inspect.currentframe())
     if current_module is None:
-        # fallback
         import sys
         mod = sys.modules[__name__]
     else:
         mod = current_module
     mod._worker_voice_cache = {}
 
-# ---------- Pool de instâncias (VoicePool) ----------
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
         import queue
@@ -70,11 +67,11 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
-# ---------- Registro global de vozes (apenas caminhos) ----------
+# ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 voices_metadata: Dict[str, dict] = {}
 
-def register_voice(voice_name: str, model_path: str, config_path: str, meta: dict):
+def register_voice(voice_name, model_path, config_path, meta):
     VOICE_PATHS[voice_name] = (model_path, config_path)
     voices_metadata[voice_name] = meta
 
@@ -106,7 +103,7 @@ def load_all_voices():
                     pass
             register_voice(voice_name, model_path, config_path, {"genero": genero})
             logger.info(f"✅ Voz registrada: {voice_name} ({genero})")
-    # backward compatibility: raiz
+    # backward compatibility
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         voice_name = onnx_file.stem
         if voice_name in VOICE_PATHS:
@@ -123,7 +120,7 @@ logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 effect_cache: Dict[Tuple[str, str], AudioSegment] = {}
 ambient_cache: Dict[Tuple[str, float], AudioSegment] = {}
 
-def load_effect(voice_name: str, effect_file: str) -> AudioSegment:
+def load_effect(voice_name, effect_file):
     cache_key = (voice_name, effect_file)
     if cache_key in effect_cache:
         return effect_cache[cache_key]
@@ -138,7 +135,7 @@ def load_effect(voice_name: str, effect_file: str) -> AudioSegment:
     logger.info(f"✔ Efeito '{effect_file}' carregado (voz: {voice_name})")
     return seg
 
-def load_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
+def load_ambient(ambient_file, volume_db):
     cache_key = (ambient_file, volume_db)
     if cache_key in ambient_cache:
         return ambient_cache[cache_key]
@@ -151,10 +148,9 @@ def load_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
     logger.info(f"✔ Ambiente '{ambient_file}' carregado (volume {volume_db} dB)")
     return seg
 
-# ---------- Funções executadas nos workers (processos) ----------
+# ---------- Funções dos workers ----------
 
-def get_voice_pool(voice_name: str):
-    """Obtém/carrega VoicePool no processo worker atual."""
+def get_voice_pool(voice_name):
     import sys
     mod = sys.modules[__name__]
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -168,8 +164,7 @@ def get_voice_pool(voice_name: str):
         logger.info(f"[Worker {os.getpid()}] Voz '{voice_name}' carregada.")
     return cache[voice_name]
 
-def synthesize_text(voice_name: str, text: str, speed: float,
-                    noise_scale: float, noise_w_scale: float) -> Tuple[int, bytes]:
+def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
     try:
@@ -186,7 +181,11 @@ def synthesize_text(voice_name: str, text: str, speed: float,
     finally:
         pool.put(voice)
 
-def mix_and_export_task(segments_data: list, ambient_cfg: dict, target_rate: int = 22050) -> bytes:
+def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+    """
+    Worker de mixagem: padroniza todos os segmentos para mono, 16-bit, target_rate,
+    concatena com laço simples (robusto), normaliza, aplica ambiente e exporta.
+    """
     audio_segments = []
     for data in segments_data:
         if 'pcm_bytes' in data:
@@ -196,29 +195,28 @@ def mix_and_export_task(segments_data: list, ambient_cfg: dict, target_rate: int
                 frame_rate=data['sample_rate'],
                 channels=1
             )
-            audio_segments.append(seg)
         elif 'effect' in data:
             voice_dir = VOICES_DIR / data['voice']
             effect_path = voice_dir / data['effect']
             if not effect_path.exists():
                 effect_path = EFFECTS_DIR / data['effect']
             seg = AudioSegment.from_wav(str(effect_path))
-            audio_segments.append(seg)
+        else:
+            continue
+
+        # Padronização obrigatória
+        seg = seg.set_channels(1)
+        seg = seg.set_sample_width(2)      # 16 bits
+        seg = seg.set_frame_rate(target_rate)
+        audio_segments.append(seg)
 
     if not audio_segments:
         raise ValueError("Nenhum segmento para mixagem")
 
-    # Uniformiza sample rate
-    uniform = []
+    # Concatenação simples e robusta (evita erro de array)
+    combined = AudioSegment.empty()
     for seg in audio_segments:
-        if seg.frame_rate != target_rate:
-            seg = seg.set_frame_rate(target_rate)
-        uniform.append(seg)
-
-    if len(uniform) == 1:
-        combined = uniform[0]
-    else:
-        combined = AudioSegment.from_mono_audiosegments(*uniform)
+        combined += seg
 
     # Normalização
     target_dBFS = -20.0
@@ -230,27 +228,23 @@ def mix_and_export_task(segments_data: list, ambient_cfg: dict, target_rate: int
         ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
         ambient = AudioSegment.from_wav(str(ambient_path))
         ambient = ambient + ambient_cfg.get('volume_db', -15)
-        if ambient.frame_rate != target_rate:
-            ambient = ambient.set_frame_rate(target_rate)
+        ambient = ambient.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
         if len(ambient) < len(combined):
             ambient = ambient * ((len(combined) // len(ambient)) + 1)
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
 
-    # Exporta para WebM (Opus)
+    # Exporta WebM
     with io.BytesIO() as out_buf:
         combined.export(out_buf, format="webm", codec="libopus",
                         parameters=["-b:a", "64k"])
         return out_buf.getvalue()
 
-# ---------- Pools de processos (criados após definições) ----------
-tts_pool = ProcessPoolExecutor(
-    max_workers=TTS_WORKERS,
-    initializer=_init_tts_worker
-)
+# ---------- Pools de processos ----------
+tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
 mix_pool = ProcessPoolExecutor(max_workers=MIX_WORKERS)
 
-# ---------- Modelos da API ----------
+# ---------- Modelos ----------
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -264,7 +258,7 @@ class SpeakerMapping(BaseModel):
     noise_w_scale: Optional[float] = Field(default=None, ge=0.0, le=2.0)
 
 class TTSRequest(BaseModel):
-    voice: Optional[str] = Field(None, description="Nome da voz (modo único)")
+    voice: Optional[str] = None
     text: str = Field(..., min_length=1)
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     noise_scale: float = Field(default=0.667, ge=0.0, le=1.5)
@@ -281,7 +275,7 @@ async def synthesize(req: TTSRequest):
     t_total_start = time.perf_counter()
     logger.info(f"🔔 Nova requisição: text='{req.text[:50]}...', effects={list(req.effects.keys())}, ambient={req.ambient.enabled}")
 
-    # --- Validação e mapeamento de speakers ---
+    # Validação e mapeamento de speakers
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
@@ -301,7 +295,7 @@ async def synthesize(req: TTSRequest):
                 raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
         current_role = None
 
-    # --- Divisão e classificação dos fragmentos ---
+    # Divisão do texto
     t_div_start = time.perf_counter()
     parts = re.split(r'(\[.*?\])', req.text)
     parts = [p.strip() for p in parts if p.strip()]
@@ -338,16 +332,13 @@ async def synthesize(req: TTSRequest):
             noise_s = req.noise_scale
             noise_w = req.noise_w_scale
 
-        fut = loop.run_in_executor(
-            tts_pool,
-            synthesize_text,
-            voice_name, part, speed, noise_s, noise_w
-        )
+        fut = loop.run_in_executor(tts_pool, synthesize_text,
+                                   voice_name, part, speed, noise_s, noise_w)
         tts_tasks.append((fut, idx))
 
     logger.info(f"🔹 Planejamento: {len(tts_tasks)} sínteses, {sum(1 for s in segment_data if s and 'effect' in s)} efeitos ({time.perf_counter()-t_plan_start:.4f}s)")
 
-    # --- Aguardar sínteses ---
+    # Aguardar sínteses
     t_synth_start = time.perf_counter()
     if tts_tasks:
         futures, indices = zip(*tts_tasks)
@@ -361,27 +352,22 @@ async def synthesize(req: TTSRequest):
         t_synth_end = time.perf_counter()
         logger.info("🔹 Nenhuma síntese necessária.")
 
-    # --- Preparar payload para mixagem ---
+    # Preparar payload para mixagem
     t_seg_start = time.perf_counter()
     mix_payload = [d for d in segment_data if d is not None]
     logger.info(f"🔹 Payload de mixagem: {len(mix_payload)} segmentos ({time.perf_counter()-t_seg_start:.4f}s)")
 
-    # Serialização do ambient (compatível Pydantic v1 e v2)
+    # Serialização compatível do ambient
     try:
         ambient_dict = req.ambient.model_dump()
     except AttributeError:
-        ambient_dict = req.ambient.dict()  # fallback Pydantic v1
+        ambient_dict = req.ambient.dict()
 
-    # --- Mixagem e exportação em worker separado ---
+    # Mixagem em worker separado
     t_mix_start = time.perf_counter()
     try:
-        mixed_bytes = await loop.run_in_executor(
-            mix_pool,
-            mix_and_export_task,
-            mix_payload,
-            ambient_dict,
-            22050
-        )
+        mixed_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
+                                                mix_payload, ambient_dict, 22050)
     except Exception as e:
         logger.error(f"❌ Falha na mixagem/exportação: {e}")
         raise HTTPException(500, f"Erro na mixagem: {str(e)}")
@@ -395,7 +381,7 @@ async def synthesize(req: TTSRequest):
 
     return Response(content=mixed_bytes, media_type="audio/webm")
 
-# ---------- Health endpoints ----------
+# ---------- Health ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
