@@ -4,11 +4,46 @@ import io
 import time
 import logging
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
+# ---------- Instalação automática de dependências ----------
+def ensure_dependencies():
+    """
+    Garante que as bibliotecas 'numpy' e 'av' estejam instaladas.
+    Se não estiverem, faz a instalação via pip no próprio ambiente.
+    ATENÇÃO: em produção, o ideal é instalar durante o build da imagem.
+    """
+    missing = []
+    try:
+        import numpy  # noqa
+    except ImportError:
+        missing.append("numpy")
+    try:
+        import av  # noqa
+    except ImportError:
+        missing.append("av")
+
+    if missing:
+        logger.warning(f"Instalando dependências ausentes: {missing}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+        # Força recarregar após instalação
+        import importlib
+        for lib in missing:
+            importlib.import_module(lib)
+        logger.info("Dependências instaladas com sucesso.")
+    else:
+        logger.info("Dependências OK (numpy, av)")
+
+# Chama antes de tudo
+ensure_dependencies()
+
+import numpy as np
+import av
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
@@ -46,7 +81,6 @@ def _init_tts_worker():
     ort.set_default_logger_severity(3)
     current_module = inspect.getmodule(inspect.currentframe())
     if current_module is None:
-        import sys
         mod = sys.modules[__name__]
     else:
         mod = current_module
@@ -148,7 +182,7 @@ def load_ambient(ambient_file, volume_db):
     logger.info(f"✔ Ambiente '{ambient_file}' carregado (volume {volume_db} dB)")
     return seg
 
-# ---------- Funções dos workers ----------
+# ---------- Funções executadas nos workers (processos) ----------
 
 def get_voice_pool(voice_name):
     import sys
@@ -181,11 +215,36 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
+def encode_webm_opus(pcm_bytes: bytes, sample_rate: int, channels: int = 1,
+                     bitrate: str = "64k") -> bytes:
+    """
+    Codifica PCM 16-bit mono para Opus e encapsula em WebM usando PyAV.
+    """
+    output = io.BytesIO()
+    container = av.open(output, mode='w', format='webm')
+    stream = container.add_stream('opus', rate=sample_rate)
+    stream.channels = channels
+    stream.bit_rate = int(bitrate.replace('k', '000'))
+
+    # Converte bytes para array numpy e depois para AudioFrame
+    audio_array = np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels)
+    frame = av.AudioFrame.from_ndarray(audio_array, format='s16',
+                                       layout='mono' if channels == 1 else 'stereo')
+    frame.sample_rate = sample_rate
+
+    for packet in stream.encode(frame):
+        container.mux(packet)
+    for packet in stream.encode(None):
+        container.mux(packet)
+
+    container.close()
+    return output.getvalue()
+
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     """
-    Worker de mixagem: padroniza todos os segmentos para mono, 16-bit, target_rate,
-    concatena com laço simples (robusto), normaliza, aplica ambiente e exporta.
+    Worker de mixagem: padroniza, concatena, normaliza, ambiente, exporta WebM.
     """
+    # 1. Monta segmentos padronizados
     audio_segments = []
     for data in segments_data:
         if 'pcm_bytes' in data:
@@ -203,42 +262,45 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             seg = AudioSegment.from_wav(str(effect_path))
         else:
             continue
-
-        # Padronização obrigatória
         seg = seg.set_channels(1)
-        seg = seg.set_sample_width(2)      # 16 bits
+        seg = seg.set_sample_width(2)
         seg = seg.set_frame_rate(target_rate)
         audio_segments.append(seg)
 
     if not audio_segments:
         raise ValueError("Nenhum segmento para mixagem")
 
-    # Concatenação simples e robusta (evita erro de array)
+    # 2. Concatenação robusta
     combined = AudioSegment.empty()
     for seg in audio_segments:
         combined += seg
 
-    # Normalização
+    # 3. Normalização
     target_dBFS = -20.0
     if combined.dBFS != target_dBFS:
         combined = combined.apply_gain(target_dBFS - combined.dBFS)
 
-    # Ambiente
+    # 4. Ambiente (com cache local no worker)
     if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
-        ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-        ambient = AudioSegment.from_wav(str(ambient_path))
-        ambient = ambient + ambient_cfg.get('volume_db', -15)
-        ambient = ambient.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
+        cache_key = (ambient_cfg['file'], ambient_cfg.get('volume_db', -15))
+        if not hasattr(mix_and_export_task, '_ambient_cache'):
+            mix_and_export_task._ambient_cache = {}
+        if cache_key not in mix_and_export_task._ambient_cache:
+            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
+            ambient = AudioSegment.from_wav(str(ambient_path))
+            ambient = ambient + ambient_cfg.get('volume_db', -15)
+            ambient = ambient.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
+            mix_and_export_task._ambient_cache[cache_key] = ambient
+        ambient = mix_and_export_task._ambient_cache[cache_key]
+
         if len(ambient) < len(combined):
             ambient = ambient * ((len(combined) // len(ambient)) + 1)
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
 
-    # Exporta WebM
-    with io.BytesIO() as out_buf:
-        combined.export(out_buf, format="webm", codec="libopus",
-                        parameters=["-b:a", "64k"])
-        return out_buf.getvalue()
+    # 5. Exporta para WebM com PyAV
+    pcm_bytes = combined.raw_data  # raw PCM 16-bit mono
+    return encode_webm_opus(pcm_bytes, target_rate, channels=1, bitrate="64k")
 
 # ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
@@ -268,7 +330,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Multiprocessing)")
+app = FastAPI(title="Piper TTS API (Multiprocessing + PyAV)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
