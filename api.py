@@ -1,49 +1,23 @@
 import os
 import re
 import io
+import sys
 import time
 import logging
-import inspect
 import subprocess
-import sys
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
-# ---------- Instalação automática de dependências ----------
-def ensure_dependencies():
-    """
-    Garante que as bibliotecas 'numpy' e 'av' estejam instaladas.
-    Se não estiverem, faz a instalação via pip no próprio ambiente.
-    ATENÇÃO: em produção, o ideal é instalar durante o build da imagem.
-    """
-    missing = []
-    try:
-        import numpy  # noqa
-    except ImportError:
-        missing.append("numpy")
-    try:
-        import av  # noqa
-    except ImportError:
-        missing.append("av")
-
-    if missing:
-        logger.warning(f"Instalando dependências ausentes: {missing}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-        # Força recarregar após instalação
-        import importlib
-        for lib in missing:
-            importlib.import_module(lib)
-        logger.info("Dependências instaladas com sucesso.")
-    else:
-        logger.info("Dependências OK (numpy, av)")
-
-# Chama antes de tudo
-ensure_dependencies()
+# ---------- Instalação automática do PyAV (se necessário) ----------
+try:
+    import av
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
+    import av
 
 import numpy as np
-import av
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
@@ -79,11 +53,7 @@ logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
     ort.set_default_logger_severity(3)
-    current_module = inspect.getmodule(inspect.currentframe())
-    if current_module is None:
-        mod = sys.modules[__name__]
-    else:
-        mod = current_module
+    mod = sys.modules['__main__']
     mod._worker_voice_cache = {}
 
 # ---------- VoicePool ----------
@@ -137,7 +107,6 @@ def load_all_voices():
                     pass
             register_voice(voice_name, model_path, config_path, {"genero": genero})
             logger.info(f"✅ Voz registrada: {voice_name} ({genero})")
-    # backward compatibility
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         voice_name = onnx_file.stem
         if voice_name in VOICE_PATHS:
@@ -166,7 +135,6 @@ def load_effect(voice_name, effect_file):
         raise FileNotFoundError(f"Efeito '{effect_file}' não encontrado")
     seg = AudioSegment.from_wav(str(effect_path))
     effect_cache[cache_key] = seg
-    logger.info(f"✔ Efeito '{effect_file}' carregado (voz: {voice_name})")
     return seg
 
 def load_ambient(ambient_file, volume_db):
@@ -179,14 +147,12 @@ def load_ambient(ambient_file, volume_db):
     seg = AudioSegment.from_wav(str(ambient_path))
     seg = seg + volume_db
     ambient_cache[cache_key] = seg
-    logger.info(f"✔ Ambiente '{ambient_file}' carregado (volume {volume_db} dB)")
     return seg
 
-# ---------- Funções executadas nos workers (processos) ----------
+# ---------- Funções dos workers ----------
 
 def get_voice_pool(voice_name):
-    import sys
-    mod = sys.modules[__name__]
+    mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
     if cache is None:
         cache = {}
@@ -195,7 +161,6 @@ def get_voice_pool(voice_name):
         model_path, config_path = VOICE_PATHS[voice_name]
         pool = VoicePool(model_path, config_path)
         cache[voice_name] = pool
-        logger.info(f"[Worker {os.getpid()}] Voz '{voice_name}' carregada.")
     return cache[voice_name]
 
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
@@ -215,24 +180,22 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-def encode_webm_opus(pcm_bytes: bytes, sample_rate: int, channels: int = 1,
-                     bitrate: str = "64k") -> bytes:
-    """
-    Codifica PCM 16-bit mono para Opus e encapsula em WebM usando PyAV.
-    """
+def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
+    """Codifica PCM 16-bit para WebM/Opus usando PyAV."""
     output = io.BytesIO()
     container = av.open(output, mode='w', format='webm')
     stream = container.add_stream('opus', rate=sample_rate)
     stream.channels = channels
-    stream.bit_rate = int(bitrate.replace('k', '000'))
+    stream.bit_rate = bitrate
 
-    # Converte bytes para array numpy e depois para AudioFrame
-    audio_array = np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels)
-    frame = av.AudioFrame.from_ndarray(audio_array, format='s16',
-                                       layout='mono' if channels == 1 else 'stereo')
-    frame.sample_rate = sample_rate
+    audio_frame = av.AudioFrame.from_ndarray(
+        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels),
+        format='s16',
+        layout='mono' if channels == 1 else 'stereo'
+    )
+    audio_frame.sample_rate = sample_rate
 
-    for packet in stream.encode(frame):
+    for packet in stream.encode(audio_frame):
         container.mux(packet)
     for packet in stream.encode(None):
         container.mux(packet)
@@ -241,10 +204,7 @@ def encode_webm_opus(pcm_bytes: bytes, sample_rate: int, channels: int = 1,
     return output.getvalue()
 
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
-    """
-    Worker de mixagem: padroniza, concatena, normaliza, ambiente, exporta WebM.
-    """
-    # 1. Monta segmentos padronizados
+    # Monta segmentos padronizados
     audio_segments = []
     for data in segments_data:
         if 'pcm_bytes' in data:
@@ -262,25 +222,22 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             seg = AudioSegment.from_wav(str(effect_path))
         else:
             continue
-        seg = seg.set_channels(1)
-        seg = seg.set_sample_width(2)
-        seg = seg.set_frame_rate(target_rate)
+        seg = seg.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
         audio_segments.append(seg)
 
     if not audio_segments:
         raise ValueError("Nenhum segmento para mixagem")
 
-    # 2. Concatenação robusta
     combined = AudioSegment.empty()
     for seg in audio_segments:
         combined += seg
 
-    # 3. Normalização
+    # Normalização
     target_dBFS = -20.0
     if combined.dBFS != target_dBFS:
         combined = combined.apply_gain(target_dBFS - combined.dBFS)
 
-    # 4. Ambiente (com cache local no worker)
+    # Ambiente com cache local ao processo
     if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
         cache_key = (ambient_cfg['file'], ambient_cfg.get('volume_db', -15))
         if not hasattr(mix_and_export_task, '_ambient_cache'):
@@ -298,9 +255,10 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
 
-    # 5. Exporta para WebM com PyAV
-    pcm_bytes = combined.raw_data  # raw PCM 16-bit mono
-    return encode_webm_opus(pcm_bytes, target_rate, channels=1, bitrate="64k")
+    # Codificação WebM/Opus via PyAV
+    pcm_bytes = combined.raw_data
+    webm_bytes = encode_webm_opus(pcm_bytes, target_rate)
+    return webm_bytes
 
 # ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
@@ -330,14 +288,13 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Multiprocessing + PyAV)")
+app = FastAPI(title="Piper TTS API (Multiprocessing)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     t_total_start = time.perf_counter()
-    logger.info(f"🔔 Nova requisição: text='{req.text[:50]}...', effects={list(req.effects.keys())}, ambient={req.ambient.enabled}")
 
-    # Validação e mapeamento de speakers
+    # --- Validação e mapeamento de speakers ---
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
@@ -357,14 +314,10 @@ async def synthesize(req: TTSRequest):
                 raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
         current_role = None
 
-    # Divisão do texto
-    t_div_start = time.perf_counter()
+    # --- Divisão e planejamento ---
     parts = re.split(r'(\[.*?\])', req.text)
     parts = [p.strip() for p in parts if p.strip()]
-    logger.info(f"🔹 Texto dividido em {len(parts)} partes ({time.perf_counter()-t_div_start:.4f}s)")
 
-    # Planejamento
-    t_plan_start = time.perf_counter()
     tts_tasks = []
     segment_data = [None] * len(parts)
     loop = asyncio.get_running_loop()
@@ -374,12 +327,10 @@ async def synthesize(req: TTSRequest):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
-                logger.info(f"🗣️ Speaker -> {current_role}")
             continue
 
         if part in req.effects:
             effect_file = req.effects[part]
-            logger.info(f"🎬 Efeito '{part}' -> '{effect_file}'")
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
             segment_data[idx] = {'effect': effect_file, 'voice': voice_for_eff}
             continue
@@ -398,9 +349,7 @@ async def synthesize(req: TTSRequest):
                                    voice_name, part, speed, noise_s, noise_w)
         tts_tasks.append((fut, idx))
 
-    logger.info(f"🔹 Planejamento: {len(tts_tasks)} sínteses, {sum(1 for s in segment_data if s and 'effect' in s)} efeitos ({time.perf_counter()-t_plan_start:.4f}s)")
-
-    # Aguardar sínteses
+    # --- Síntese em paralelo ---
     t_synth_start = time.perf_counter()
     if tts_tasks:
         futures, indices = zip(*tts_tasks)
@@ -408,38 +357,39 @@ async def synthesize(req: TTSRequest):
         for (sr, pcm), idx in zip(results, indices):
             segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
         t_synth_end = time.perf_counter()
-        total_dur = sum(len(r[1])/2/22050 for r in results) if results else 0
-        logger.info(f"🔹 Sínteses concluídas em {t_synth_end-t_synth_start:.4f}s (RTF ~ {(t_synth_end-t_synth_start)/total_dur if total_dur else 0:.3f})")
     else:
         t_synth_end = time.perf_counter()
-        logger.info("🔹 Nenhuma síntese necessária.")
 
-    # Preparar payload para mixagem
-    t_seg_start = time.perf_counter()
+    # --- Preparar payload para mixagem ---
     mix_payload = [d for d in segment_data if d is not None]
-    logger.info(f"🔹 Payload de mixagem: {len(mix_payload)} segmentos ({time.perf_counter()-t_seg_start:.4f}s)")
 
-    # Serialização compatível do ambient
+    # Serialização compatível Pydantic v1/v2
     try:
         ambient_dict = req.ambient.model_dump()
     except AttributeError:
         ambient_dict = req.ambient.dict()
 
-    # Mixagem em worker separado
+    # --- Mixagem e exportação ---
     t_mix_start = time.perf_counter()
     try:
         mixed_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
-                                                mix_payload, ambient_dict, 22050)
+                                                 mix_payload, ambient_dict, 22050)
     except Exception as e:
         logger.error(f"❌ Falha na mixagem/exportação: {e}")
         raise HTTPException(500, f"Erro na mixagem: {str(e)}")
-
     t_mix_end = time.perf_counter()
-    logger.info(f"🔹 Mixagem + exportação: {t_mix_end-t_mix_start:.4f}s")
 
-    tempo_total = time.perf_counter() - t_total_start
-    audio_est = sum(len(d.get('pcm_bytes',''))/2/22050 for d in mix_payload if 'pcm_bytes' in d)
-    logger.info(f"✅ Requisição concluída | tempo_total={tempo_total:.3f}s | áudio estimado={audio_est:.1f}s")
+    # --- Cálculo dos tempos e duração do áudio ---
+    synth_duration = t_synth_end - t_synth_start
+    mix_duration = t_mix_end - t_mix_start
+    total_time = time.perf_counter() - t_total_start
+    audio_est = sum(len(d.get('pcm_bytes', b'')) / 2 / 22050 for d in mix_payload if 'pcm_bytes' in d)
+
+    # Única linha de log com todos os tempos
+    logger.info(
+        f"✅ Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
+        f"mix={mix_duration:.3f}s | audio={audio_est:.1f}s"
+    )
 
     return Response(content=mixed_bytes, media_type="audio/webm")
 
