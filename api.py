@@ -10,26 +10,7 @@ from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
-# ---------- Instalação automática do PyAV (se necessário) ----------def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
-    output = io.BytesIO()
-    container = av.open(output, mode='w', format='webm')
-    stream = container.add_stream('opus', rate=sample_rate, channels=channels)
-    stream.bit_rate = bitrate
-
-    audio_frame = av.AudioFrame.from_ndarray(
-        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels),
-        format='s16',
-        layout='mono' if channels == 1 else 'stereo'
-    )
-    audio_frame.sample_rate = sample_rate
-
-    for packet in stream.encode(audio_frame):
-        container.mux(packet)
-    for packet in stream.encode(None):
-        container.mux(packet)
-
-    container.close()
-    return output.getvalue()
+# ---------- Instalação automática do PyAV (se necessário) ----------
 try:
     import av
 except ImportError:
@@ -67,7 +48,7 @@ EFFECTS_DIR.mkdir(exist_ok=True)
 # ---------- Workers ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 10))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
-logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
+logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
@@ -198,11 +179,15 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
         return sample_rate, audio_bytes
     finally:
         pool.put(voice)
-def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
+
+def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate="64k"):
+    """
+    Codifica PCM 16-bit mono para WebM/Opus usando PyAV.
+    """
     output = io.BytesIO()
     container = av.open(output, mode='w', format='webm')
     stream = container.add_stream('opus', rate=sample_rate, channels=channels)
-    stream.bit_rate = bitrate
+    stream.bit_rate = int(bitrate.replace('k', '000'))
 
     audio_frame = av.AudioFrame.from_ndarray(
         np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels),
@@ -220,7 +205,7 @@ def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
     return output.getvalue()
 
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
-    # Monta segmentos padronizados
+    # Monta segmentos padronizados (mono, 16-bit, target_rate)
     audio_segments = []
     for data in segments_data:
         if 'pcm_bytes' in data:
@@ -372,9 +357,7 @@ async def synthesize(req: TTSRequest):
         results = await asyncio.gather(*futures)
         for (sr, pcm), idx in zip(results, indices):
             segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
-        t_synth_end = time.perf_counter()
-    else:
-        t_synth_end = time.perf_counter()
+    t_synth_end = time.perf_counter()
 
     # --- Preparar payload para mixagem ---
     mix_payload = [d for d in segment_data if d is not None]
@@ -395,13 +378,12 @@ async def synthesize(req: TTSRequest):
         raise HTTPException(500, f"Erro na mixagem: {str(e)}")
     t_mix_end = time.perf_counter()
 
-    # --- Cálculo dos tempos e duração do áudio ---
+    # --- Resumo final ---
     synth_duration = t_synth_end - t_synth_start
     mix_duration = t_mix_end - t_mix_start
     total_time = time.perf_counter() - t_total_start
     audio_est = sum(len(d.get('pcm_bytes', b'')) / 2 / 22050 for d in mix_payload if 'pcm_bytes' in d)
 
-    # Única linha de log com todos os tempos
     logger.info(
         f"✅ Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
         f"mix={mix_duration:.3f}s | audio={audio_est:.1f}s"
