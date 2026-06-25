@@ -1,12 +1,12 @@
 import os
 import re
-import io
 import sys
 import time
 import json
 import logging
 import subprocess
 import tempfile
+import wave
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor
 import asyncio
 from collections import defaultdict
 
-# ---------- Instalação automática do Piper (se necessário) ----------
+# ---------- Instalação automática do Piper ----------
 try:
     from piper import PiperVoice, SynthesisConfig
 except ImportError:
@@ -54,7 +54,7 @@ _cpu_lock = mp.Lock()
 # ---------- Workers (configuração otimizada) ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
-logger.info(f"api nova! Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
+logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
@@ -97,9 +97,9 @@ def _init_mix_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
-# ---------- VoicePool ----------
+# ---------- VoicePool (cada worker TTS tem seu próprio pool) ----------
 class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
@@ -159,42 +159,7 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Caches para efeitos e ambiente (processo principal) ----------
-effect_cache: Dict[Tuple[str, str], bytes] = {}
-ambient_cache: Dict[Tuple[str, float], bytes] = {}
-
-def load_effect_bytes(voice_name: str, effect_file: str) -> bytes:
-    cache_key = (voice_name, effect_file)
-    if cache_key in effect_cache:
-        return effect_cache[cache_key]
-
-    voice_dir = VOICES_DIR / voice_name
-    effect_path = voice_dir / effect_file
-    if not effect_path.exists():
-        effect_path = EFFECTS_DIR / effect_file
-    if not effect_path.exists():
-        raise FileNotFoundError(f"Efeito '{effect_file}' não encontrado")
-
-    with open(effect_path, 'rb') as f:
-        data = f.read()
-    effect_cache[cache_key] = data
-    return data
-
-def load_ambient_bytes(ambient_file: str, volume_db: float) -> bytes:
-    cache_key = (ambient_file, volume_db)
-    if cache_key in ambient_cache:
-        return ambient_cache[cache_key]
-
-    ambient_path = AMBIENT_DIR / f"{ambient_file}.wav"
-    if not ambient_path.exists():
-        raise FileNotFoundError(f"Ambiente '{ambient_file}.wav' não encontrado")
-
-    with open(ambient_path, 'rb') as f:
-        data = f.read()
-    ambient_cache[cache_key] = data
-    return data
-
-# ---------- Funções executadas nos workers ----------
+# ---------- Função para obter o pool de vozes (dentro do worker TTS) ----------
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -207,6 +172,7 @@ def get_voice_pool(voice_name):
         cache[voice_name] = pool
     return cache[voice_name]
 
+# ---------- Síntese de um fragmento (texto) ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -224,31 +190,32 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
+# ---------- Mixagem usando FFmpeg (corrigida) ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
-    """
-    Mixa múltiplos segmentos usando FFmpeg (único comando) e retorna bytes WAV.
-    """
     t0 = time.perf_counter()
     temp_files = []
     ffmpeg_cmd = ["ffmpeg", "-y"]
 
     try:
-        # 1. Prepara arquivos temporários para cada segmento
         for data in segments_data:
             if 'pcm_bytes' in data:
+                # Cria um arquivo WAV com cabeçalho
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    f.write(data['pcm_bytes'])
-                    temp_files.append(f.name)
+                    wav_path = f.name
+                with wave.open(wav_path, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(data['sample_rate'])
+                    wav_file.writeframes(data['pcm_bytes'])
+                temp_files.append(wav_path)
+
             elif 'effect' in data:
-                # Efeito já está em cache no processo principal, mas aqui precisamos do arquivo.
-                # Como estamos no worker, não temos o cache. Carregamos do disco.
                 voice_dir = VOICES_DIR / data['voice']
                 effect_path = voice_dir / data['effect']
                 if not effect_path.exists():
                     effect_path = EFFECTS_DIR / data['effect']
                 if not effect_path.exists():
                     raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
-                # Copia para temp para padronizar
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     with open(effect_path, 'rb') as src:
                         f.write(src.read())
@@ -256,7 +223,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 continue
 
-        # 2. Adiciona ambiente, se habilitado
+        # Adicionar ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
@@ -268,7 +235,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         if not temp_files:
             raise ValueError("Nenhum arquivo para mixar")
 
-        # 3. Monta comando FFmpeg
         for f in temp_files:
             ffmpeg_cmd.extend(["-i", f])
 
@@ -282,7 +248,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             "pipe:1"
         ])
 
-        # 4. Executa
         result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
         wav_bytes = result.stdout
 
@@ -299,6 +264,70 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 os.unlink(f)
             except:
                 pass
+
+# ---------- Processamento de uma requisição inteira (dentro do worker TTS) ----------
+def process_entire_request(
+    voice_name: Optional[str],
+    text: str,
+    speed: float,
+    noise_scale: float,
+    noise_w_scale: float,
+    effects: Dict[str, str],
+    speakers: List[Dict],
+    ambient_cfg: Dict,
+) -> bytes:
+    t_start = time.perf_counter()
+
+    is_dialog = bool(speakers)
+    if not is_dialog:
+        if not voice_name:
+            raise ValueError("voice_name é obrigatório no modo simples")
+        speaker_map = {None: (voice_name, speed, noise_scale, noise_w_scale)}
+        current_role = None
+    else:
+        speaker_map = {}
+        for spk in speakers:
+            noise_s = spk.get('noise_scale', noise_scale)
+            noise_w = spk.get('noise_w_scale', noise_w_scale)
+            speaker_map[spk['role']] = (spk['voice'], spk['speed'], noise_s, noise_w)
+        current_role = None
+
+    parts = re.split(r'(\[.*?\])', text)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    segments = []
+    for part in parts:
+        if is_dialog and part.startswith('[') and part.endswith(']'):
+            role = part[1:-1]
+            if role in speaker_map:
+                current_role = role
+            continue
+
+        if part in effects:
+            effect_file = effects[part]
+            voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
+            segments.append({'effect': effect_file, 'voice': voice_for_eff})
+            continue
+
+        if is_dialog:
+            if current_role is None:
+                raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
+            v_name, spd, ns, nw = speaker_map[current_role]
+        else:
+            v_name = voice_name
+            spd = speed
+            ns = noise_scale
+            nw = noise_w_scale
+
+        sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
+        segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
+
+    # Mixagem (chamada síncrona dentro do mesmo worker)
+    wav_bytes = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
+
+    t_total = time.perf_counter() - t_start
+    logger.info(f"Worker TTS processou requisição em {t_total:.3f}s | {len(segments)} segmentos")
+    return wav_bytes
 
 # ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(
@@ -334,139 +363,64 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Otimizada + FFmpeg)")
+app = FastAPI(title="Piper TTS API (Requisição Inteira por Worker)")
 
-# ---------- Estatísticas acumuladas para relatório ----------
+# ---------- Estatísticas ----------
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
-    global stats
     t_total_start = time.perf_counter()
 
-    # --- 1. Parse e validação ---
-    t_parse_start = time.perf_counter()
-    is_dialog = bool(req.speakers)
-    if not is_dialog:
-        if not req.voice:
-            raise HTTPException(400, "Campo 'voice' é obrigatório")
-        if req.voice not in VOICE_PATHS:
-            raise HTTPException(404, f"Voz '{req.voice}' não encontrada")
-        speaker_map = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
-        current_role = None
-    else:
-        speaker_map = {}
+    # Converter speakers para lista de dicionários
+    speakers_list = []
+    if req.speakers:
         for spk in req.speakers:
-            noise_s = spk.noise_scale if spk.noise_scale is not None else req.noise_scale
-            noise_w = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
-            speaker_map[spk.role] = (spk.voice, spk.speed, noise_s, noise_w)
-        for role, (v, _, _, _) in speaker_map.items():
-            if v not in VOICE_PATHS:
-                raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
-        current_role = None
+            speakers_list.append({
+                'role': spk.role,
+                'voice': spk.voice,
+                'speed': spk.speed,
+                'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
+                'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
+            })
 
-    t_parse = time.perf_counter() - t_parse_start
-
-    # --- 2. Divisão do texto ---
-    t_split_start = time.perf_counter()
-    parts = re.split(r'(\[.*?\])', req.text)
-    parts = [p.strip() for p in parts if p.strip()]
-    t_split = time.perf_counter() - t_split_start
-
-    # --- 3. Preparação das tarefas TTS e mix ---
-    t_prep_start = time.perf_counter()
-    tts_tasks = []
-    segment_data = [None] * len(parts)
-    loop = asyncio.get_running_loop()
-
-    for idx, part in enumerate(parts):
-        if is_dialog and part.startswith('[') and part.endswith(']'):
-            role = part[1:-1]
-            if role in speaker_map:
-                current_role = role
-            continue
-
-        if part in req.effects:
-            effect_file = req.effects[part]
-            voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
-            segment_data[idx] = {'effect': effect_file, 'voice': voice_for_eff}
-            continue
-
-        if is_dialog:
-            if current_role is None:
-                raise HTTPException(400, "Speaker não definido. Use [papel] antes do texto.")
-            voice_name, speed, noise_s, noise_w = speaker_map[current_role]
-        else:
-            voice_name = req.voice
-            speed = req.speed
-            noise_s = req.noise_scale
-            noise_w = req.noise_w_scale
-
-        fut = loop.run_in_executor(tts_pool, synthesize_text,
-                                   voice_name, part, speed, noise_s, noise_w)
-        tts_tasks.append((fut, idx))
-
-    t_prep = time.perf_counter() - t_prep_start
-
-    # --- 4. Execução das sínteses em paralelo ---
-    t_synth_total_start = time.perf_counter()
-    synth_times = []
-    if tts_tasks:
-        futures, indices = zip(*tts_tasks)
-        results = await asyncio.gather(*futures)
-        for (sr, pcm), idx in zip(results, indices):
-            segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
-    t_synth_total = time.perf_counter() - t_synth_total_start
-
-    # --- 5. Preparação do payload para mixagem ---
-    t_mix_prep_start = time.perf_counter()
-    mix_payload = [d for d in segment_data if d is not None]
     try:
         ambient_dict = req.ambient.model_dump()
     except AttributeError:
         ambient_dict = req.ambient.dict()
-    t_mix_prep = time.perf_counter() - t_mix_prep_start
 
-    # --- 6. Mixagem e exportação ---
-    t_mix_start = time.perf_counter()
+    loop = asyncio.get_running_loop()
     try:
-        wav_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
-                                               mix_payload, ambient_dict, 22050)
+        wav_bytes = await loop.run_in_executor(
+            tts_pool,
+            process_entire_request,
+            req.voice,
+            req.text,
+            req.speed,
+            req.noise_scale,
+            req.noise_w_scale,
+            req.effects,
+            speakers_list,
+            ambient_dict
+        )
     except Exception as e:
-        logger.error(f"Falha na mixagem/exportação: {e}")
-        raise HTTPException(500, f"Erro na mixagem: {str(e)}")
-    t_mix = time.perf_counter() - t_mix_start
+        logger.error(f"Erro no processamento: {e}")
+        raise HTTPException(500, f"Falha no processamento: {str(e)}")
 
-    # --- 7. Tempos finais ---
     t_total = time.perf_counter() - t_total_start
-
-    # --- Log detalhado da requisição ---
-    logger.info(
-        f"⏱️ Tempos | total={t_total:.3f}s | parse={t_parse:.3f}s | split={t_split:.3f}s | "
-        f"prep={t_prep:.3f}s | synth_total={t_synth_total:.3f}s | mix_prep={t_mix_prep:.3f}s | mix={t_mix:.3f}s"
-    )
-
-    # --- Acumula estatísticas ---
     async with stats_lock:
         stats['total'].append(t_total)
-        stats['parse'].append(t_parse)
-        stats['split'].append(t_split)
-        stats['prep'].append(t_prep)
-        stats['synth_total'].append(t_synth_total)
-        stats['mix_prep'].append(t_mix_prep)
-        stats['mix'].append(t_mix)
 
+    logger.info(f"⏱️ Requisição concluída em {t_total:.3f}s")
     return Response(content=wav_bytes, media_type="audio/wav")
 
-# ---------- Endpoint para relatório de estatísticas ----------
+# ---------- Endpoint de estatísticas ----------
 @app.get("/stats")
 async def get_stats():
-    """Retorna um relatório com médias, máximos, mínimos de cada etapa."""
     async with stats_lock:
         if not stats['total']:
             return {"message": "Nenhuma requisição processada ainda."}
-
         report = {}
         for key, values in stats.items():
             report[key] = {
@@ -501,7 +455,6 @@ async def health():
         "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS}
     }
 
-# ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
