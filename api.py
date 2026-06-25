@@ -23,8 +23,8 @@ except ImportError:
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 # ---------- Configuração de logs ----------
@@ -52,6 +52,7 @@ _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
 # ---------- Workers (configuração via env) ----------
+# NÃO forçamos 1 thread – deixamos o ONNX Runtime gerenciar
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 20))
@@ -88,8 +89,8 @@ def update_worker_stats(worker_type, worker_id, request_time):
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["ORT_NUM_THREADS"] = "1"
+    # NÃO forçamos 1 thread – removemos OMP_NUM_THREADS e ORT_NUM_THREADS
+    # para que o ONNX Runtime possa usar múltiplas threads.
     ort.set_default_logger_severity(3)
 
     with _cpu_lock:
@@ -118,7 +119,8 @@ def _init_tts_worker():
 
 # ---------- Inicializador dos workers de mixagem ----------
 def _init_mix_worker():
-    os.environ["OMP_NUM_THREADS"] = "1"
+    # Também não forçamos threads, pois mixagem é feita via FFmpeg em subprocesso.
+    ort.set_default_logger_severity(3)
 
     with _cpu_lock:
         cpu_id = _cpu_counter.value
@@ -389,31 +391,6 @@ def process_tts_only(
 
     return segments, metrics
 
-# ---------- Processamento completo (TTS + Mix) ----------
-def process_full_request(
-    voice_name: Optional[str],
-    text: str,
-    speed: float,
-    noise_scale: float,
-    noise_w_scale: float,
-    effects: Dict[str, str],
-    speakers: List[Dict],
-    ambient_cfg: Dict,
-    enqueue_time: float,
-) -> Tuple[bytes, Dict[str, float]]:
-    """Versão unificada (antiga) – mantida para compatibilidade."""
-    segments, tts_metrics = process_tts_only(
-        voice_name, text, speed, noise_scale, noise_w_scale,
-        effects, speakers, enqueue_time
-    )
-    wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
-    metrics = {
-        **tts_metrics,
-        'mix_time': mix_time,
-        'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
-    }
-    return wav_bytes, metrics
-
 # ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
@@ -457,7 +434,7 @@ app = FastAPI(title="Piper TTS API (Otimizada com Diagnóstico)")
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
-# ---------- Endpoint principal com timeouts e semáforo ----------
+# ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     # Limita o número de requisições simultâneas
@@ -487,7 +464,6 @@ async def synthesize(req: TTSRequest):
         # --- Etapa 1: TTS (síntese) ---
         t_tts_start = time.perf_counter()
         try:
-            # Executa TTS com timeout
             tts_future = loop.run_in_executor(
                 tts_pool,
                 process_tts_only,
@@ -613,9 +589,6 @@ async def get_workers():
 @app.get("/pool_status")
 async def pool_status():
     """Informações sobre os pools e filas (estimativa)."""
-    # O ProcessPoolExecutor não expõe o tamanho da fila diretamente.
-    # Mas podemos estimar com base no número de workers e nas métricas.
-    # Usamos o número de workers registrados como proxy.
     with worker_stats_lock:
         tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
         mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
@@ -637,7 +610,6 @@ async def reset_stats():
             stats[key].clear()
     with worker_stats_lock:
         for key in list(worker_stats.keys()):
-            # Reseta contadores mas mantém os workers registrados
             data = worker_stats[key]
             data["requests_processed"] = 0
             data["total_time"] = 0.0
