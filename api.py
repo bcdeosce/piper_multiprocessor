@@ -183,19 +183,24 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
 def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate="64k"):
     """
     Codifica PCM 16-bit mono para WebM/Opus usando PyAV.
+    Com layout='mono' em vez de channels (compatível PyAV 17+).
     """
     output = io.BytesIO()
     container = av.open(output, mode='w', format='webm')
-    stream = container.add_stream('opus', rate=sample_rate, channels=channels)
+    stream = container.add_stream('opus', rate=sample_rate)
+    # Define o layout de canais (mono) – isso ajusta o codec internamente
+    stream.layout = 'mono'
     stream.bit_rate = int(bitrate.replace('k', '000'))
 
+    # Cria o frame de áudio
     audio_frame = av.AudioFrame.from_ndarray(
-        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels),
+        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, 1),
         format='s16',
-        layout='mono' if channels == 1 else 'stereo'
+        layout='mono'
     )
     audio_frame.sample_rate = sample_rate
 
+    # Codifica e multiplexa
     for packet in stream.encode(audio_frame):
         container.mux(packet)
     for packet in stream.encode(None):
