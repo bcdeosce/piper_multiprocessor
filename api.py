@@ -3,26 +3,27 @@ import re
 import io
 import sys
 import time
+import json
 import logging
 import subprocess
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
-# ---------- Instalação automática do PyAV (se necessário) ----------
+# ---------- Instalação automática do Piper (se necessário) ----------
 try:
-    import av
+    from piper import PiperVoice, SynthesisConfig
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
-    import av
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
+    from piper import PiperVoice, SynthesisConfig
 
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from piper import PiperVoice, SynthesisConfig
 from pydub import AudioSegment
 
 # ---------- Configuração de logs ----------
@@ -32,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("piper-api")
 
-# ---------- Forçar CPU ----------
+# ---------- Forçar CPU (sem CUDA) ----------
 ort.set_default_logger_severity(3)
 
 # ---------- Diretórios ----------
@@ -45,18 +46,68 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Workers ----------
-TTS_WORKERS = int(os.getenv("TTS_WORKERS", 10))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
+# ---------- Contador global para atribuição de núcleos ----------
+# Cada processo filho incrementa este contador com lock para pegar o próximo núcleo.
+_cpu_counter = mp.Value('i', 0)
+_cpu_lock = mp.Lock()
+
+# ---------- Workers (ajuste conforme seus núcleos) ----------
+# Para 16 vCPUs, sugiro 14 para TTS, 1 para mixagem, 1 para o FastAPI/OS.
+# Se quiser usar TODOS os 16, ajuste TTS_WORKERS=15 e MIX_WORKERS=1 (soma=16)
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", 14))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", 1))
 logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
-# ---------- Inicializador dos workers TTS ----------
+# ---------- Inicializador dos workers TTS (executado em cada processo) ----------
 def _init_tts_worker():
+    # 1. Limita o ONNX Runtime e o OpenMP a 1 thread por processo
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["ORT_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
+
+    # 2. Define afinidade de CPU (core isolation) – apenas Linux
+    with _cpu_lock:
+        cpu_id = _cpu_counter.value
+        _cpu_counter.value += 1
+
+    total_cpus = os.cpu_count()
+    if cpu_id >= total_cpus:
+        cpu_id = cpu_id % total_cpus  # round-robin se houver mais workers que núcleos
+
+    try:
+        os.sched_setaffinity(0, {cpu_id})
+        logger.info(f"TTS Worker fixado ao núcleo {cpu_id}")
+    except AttributeError:
+        logger.warning("sched_setaffinity não suportado (não é Linux). Ignorando.")
+    except Exception as e:
+        logger.warning(f"Falha ao definir afinidade no TTS: {e}")
+
+    # 3. Cache de vozes por processo
     mod = sys.modules['__main__']
     mod._worker_voice_cache = {}
 
-# ---------- VoicePool ----------
+# ---------- Inicializador dos workers de mixagem ----------
+def _init_mix_worker():
+    # Limita threads de bibliotecas que eventualmente usem OpenMP
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+    with _cpu_lock:
+        cpu_id = _cpu_counter.value
+        _cpu_counter.value += 1
+
+    total_cpus = os.cpu_count()
+    if cpu_id >= total_cpus:
+        cpu_id = cpu_id % total_cpus
+
+    try:
+        os.sched_setaffinity(0, {cpu_id})
+        logger.info(f"Mix Worker fixado ao núcleo {cpu_id}")
+    except AttributeError:
+        logger.warning("sched_setaffinity não suportado (não é Linux). Ignorando.")
+    except Exception as e:
+        logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
+
+# ---------- VoicePool (pool de instâncias PiperVoice) ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
         import queue
@@ -65,7 +116,7 @@ class VoicePool:
             voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=False)
             self.pool.put(voice)
 
-    def get(self, timeout=2.0):
+    def get(self, timeout: float = 2.0):
         return self.pool.get(timeout=timeout)
 
     def put(self, voice):
@@ -99,14 +150,13 @@ def load_all_voices():
             meta_path = item / f"{voice_name}.json"
             if meta_path.exists():
                 try:
-                    import json
                     with open(meta_path) as f:
                         meta = json.load(f)
                         genero = meta.get("genero", "Desconhecido")
-                except:
+                except Exception:
                     pass
             register_voice(voice_name, model_path, config_path, {"genero": genero})
-            logger.info(f"✅ Voz registrada: {voice_name} ({genero})")
+            logger.info(f"Voz registrada: {voice_name} ({genero})")
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         voice_name = onnx_file.stem
         if voice_name in VOICE_PATHS:
@@ -114,12 +164,12 @@ def load_all_voices():
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
             register_voice(voice_name, str(onnx_file), str(json_file), {"genero": "Personalizada"})
-            logger.info(f"✅ Voz personalizada registrada: {voice_name}")
+            logger.info(f"Voz personalizada registrada: {voice_name}")
 
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Cache de efeitos e ambiente (processo principal) ----------
+# ---------- Caches de efeitos e ambiente (processo principal) ----------
 effect_cache: Dict[Tuple[str, str], AudioSegment] = {}
 ambient_cache: Dict[Tuple[str, float], AudioSegment] = {}
 
@@ -149,9 +199,10 @@ def load_ambient(ambient_file, volume_db):
     ambient_cache[cache_key] = seg
     return seg
 
-# ---------- Funções dos workers ----------
+# ---------- Funções executadas nos workers ----------
 
 def get_voice_pool(voice_name):
+    """Retorna um pool de vozes para o processo atual (cache local)."""
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
     if cache is None:
@@ -159,11 +210,12 @@ def get_voice_pool(voice_name):
         mod._worker_voice_cache = cache
     if voice_name not in cache:
         model_path, config_path = VOICE_PATHS[voice_name]
-        pool = VoicePool(model_path, config_path)
+        pool = VoicePool(model_path, config_path, pool_size=1)  # pool_size=1 para manter simplicidade
         cache[voice_name] = pool
     return cache[voice_name]
 
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
+    """Sintetiza um trecho de texto e retorna (sample_rate, pcm_bytes)."""
     pool = get_voice_pool(voice_name)
     voice = pool.get()
     try:
@@ -180,36 +232,12 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate="64k"):
-    """
-    Codifica PCM 16-bit mono para WebM/Opus usando PyAV.
-    Com layout='mono' em vez de channels (compatível PyAV 17+).
-    """
-    output = io.BytesIO()
-    container = av.open(output, mode='w', format='webm')
-    stream = container.add_stream('opus', rate=sample_rate)
-    # Define o layout de canais (mono) – isso ajusta o codec internamente
-    stream.layout = 'mono'
-    stream.bit_rate = int(bitrate.replace('k', '000'))
-
-    # Cria o frame de áudio
-    audio_frame = av.AudioFrame.from_ndarray(
-        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, 1),
-        format='s16',
-        layout='mono'
-    )
-    audio_frame.sample_rate = sample_rate
-
-    # Codifica e multiplexa
-    for packet in stream.encode(audio_frame):
-        container.mux(packet)
-    for packet in stream.encode(None):
-        container.mux(packet)
-
-    container.close()
-    return output.getvalue()
-
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+    """
+    Recebe segmentos (PCM ou efeitos), mixa, aplica ambiente (se configurado),
+    normaliza e exporta para WAV (PCM 16-bit mono).
+    Retorna bytes do arquivo WAV.
+    """
     # Monta segmentos padronizados (mono, 16-bit, target_rate)
     audio_segments = []
     for data in segments_data:
@@ -238,14 +266,15 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     for seg in audio_segments:
         combined += seg
 
-    # Normalização
+    # Normalização para -20 dBFS
     target_dBFS = -20.0
     if combined.dBFS != target_dBFS:
         combined = combined.apply_gain(target_dBFS - combined.dBFS)
 
-    # Ambiente com cache local ao processo
+    # Ambiente com cache local ao processo (usando atributo estático)
     if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
         cache_key = (ambient_cfg['file'], ambient_cfg.get('volume_db', -15))
+        # Cache local no processo (não compartilhado entre processos)
         if not hasattr(mix_and_export_task, '_ambient_cache'):
             mix_and_export_task._ambient_cache = {}
         if cache_key not in mix_and_export_task._ambient_cache:
@@ -261,16 +290,23 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
 
-    # Codificação WebM/Opus via PyAV
-    pcm_bytes = combined.raw_data
-    webm_bytes = encode_webm_opus(pcm_bytes, target_rate)
-    return webm_bytes
+    # Exporta para WAV em memória
+    output = io.BytesIO()
+    combined.export(output, format="wav")
+    wav_bytes = output.getvalue()
+    return wav_bytes
 
-# ---------- Pools de processos ----------
-tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
-mix_pool = ProcessPoolExecutor(max_workers=MIX_WORKERS)
+# ---------- Pools de processos com isolamento de núcleos ----------
+tts_pool = ProcessPoolExecutor(
+    max_workers=TTS_WORKERS,
+    initializer=_init_tts_worker
+)
+mix_pool = ProcessPoolExecutor(
+    max_workers=MIX_WORKERS,
+    initializer=_init_mix_worker
+)
 
-# ---------- Modelos ----------
+# ---------- Modelos Pydantic ----------
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -294,7 +330,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Multiprocessing)")
+app = FastAPI(title="Piper TTS API (Core Isolation + WAV)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -304,7 +340,7 @@ async def synthesize(req: TTSRequest):
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
-            raise HTTPException(400, "Campo 'voice' é obrigatório")
+            raise HTTPException(400, "Campo 'voice' é obrigatório quando não há speakers.")
         if req.voice not in VOICE_PATHS:
             raise HTTPException(404, f"Voz '{req.voice}' não encontrada")
         speaker_map = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
@@ -320,7 +356,7 @@ async def synthesize(req: TTSRequest):
                 raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
         current_role = None
 
-    # --- Divisão e planejamento ---
+    # --- Divisão do texto em partes (diálogo, texto, efeitos) ---
     parts = re.split(r'(\[.*?\])', req.text)
     parts = [p.strip() for p in parts if p.strip()]
 
@@ -329,18 +365,21 @@ async def synthesize(req: TTSRequest):
     loop = asyncio.get_running_loop()
 
     for idx, part in enumerate(parts):
+        # Detecta marcador de papel (ex: [joao])
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
             continue
 
+        # Verifica se é um efeito sonoro (ex: "tosse", "porta")
         if part in req.effects:
             effect_file = req.effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
             segment_data[idx] = {'effect': effect_file, 'voice': voice_for_eff}
             continue
 
+        # Síntese TTS
         if is_dialog:
             if current_role is None:
                 raise HTTPException(400, "Speaker não definido. Use [papel] antes do texto.")
@@ -355,7 +394,7 @@ async def synthesize(req: TTSRequest):
                                    voice_name, part, speed, noise_s, noise_w)
         tts_tasks.append((fut, idx))
 
-    # --- Síntese em paralelo ---
+    # --- Executa todas as sínteses em paralelo ---
     t_synth_start = time.perf_counter()
     if tts_tasks:
         futures, indices = zip(*tts_tasks)
@@ -364,7 +403,7 @@ async def synthesize(req: TTSRequest):
             segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
     t_synth_end = time.perf_counter()
 
-    # --- Preparar payload para mixagem ---
+    # --- Prepara payload para mixagem ---
     mix_payload = [d for d in segment_data if d is not None]
 
     # Serialização compatível Pydantic v1/v2
@@ -373,30 +412,30 @@ async def synthesize(req: TTSRequest):
     except AttributeError:
         ambient_dict = req.ambient.dict()
 
-    # --- Mixagem e exportação ---
+    # --- Mixagem e exportação WAV ---
     t_mix_start = time.perf_counter()
     try:
-        mixed_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
-                                                 mix_payload, ambient_dict, 22050)
+        wav_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
+                                               mix_payload, ambient_dict, 22050)
     except Exception as e:
-        logger.error(f"❌ Falha na mixagem/exportação: {e}")
+        logger.error(f"Falha na mixagem/exportação: {e}")
         raise HTTPException(500, f"Erro na mixagem: {str(e)}")
     t_mix_end = time.perf_counter()
 
-    # --- Resumo final ---
+    # --- Log de desempenho ---
     synth_duration = t_synth_end - t_synth_start
     mix_duration = t_mix_end - t_mix_start
     total_time = time.perf_counter() - t_total_start
     audio_est = sum(len(d.get('pcm_bytes', b'')) / 2 / 22050 for d in mix_payload if 'pcm_bytes' in d)
 
     logger.info(
-        f"✅ Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
+        f"Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
         f"mix={mix_duration:.3f}s | audio={audio_est:.1f}s"
     )
 
-    return Response(content=mixed_bytes, media_type="audio/webm")
+    return Response(content=wav_bytes, media_type="audio/wav")
 
-# ---------- Health ----------
+# ---------- Endpoints de saúde ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
@@ -419,6 +458,7 @@ async def health():
         "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS}
     }
 
+# ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
