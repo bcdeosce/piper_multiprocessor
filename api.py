@@ -10,7 +10,26 @@ from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
 
-# ---------- Instalação automática do PyAV (se necessário) ----------
+# ---------- Instalação automática do PyAV (se necessário) ----------def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
+    output = io.BytesIO()
+    container = av.open(output, mode='w', format='webm')
+    stream = container.add_stream('opus', rate=sample_rate, channels=channels)
+    stream.bit_rate = bitrate
+
+    audio_frame = av.AudioFrame.from_ndarray(
+        np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, channels),
+        format='s16',
+        layout='mono' if channels == 1 else 'stereo'
+    )
+    audio_frame.sample_rate = sample_rate
+
+    for packet in stream.encode(audio_frame):
+        container.mux(packet)
+    for packet in stream.encode(None):
+        container.mux(packet)
+
+    container.close()
+    return output.getvalue()
 try:
     import av
 except ImportError:
@@ -179,13 +198,10 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
         return sample_rate, audio_bytes
     finally:
         pool.put(voice)
-
 def encode_webm_opus(pcm_bytes, sample_rate, channels=1, bitrate=64000):
-    """Codifica PCM 16-bit para WebM/Opus usando PyAV."""
     output = io.BytesIO()
     container = av.open(output, mode='w', format='webm')
-    stream = container.add_stream('opus', rate=sample_rate)
-    stream.channels = channels
+    stream = container.add_stream('opus', rate=sample_rate, channels=channels)
     stream.bit_rate = bitrate
 
     audio_frame = av.AudioFrame.from_ndarray(
