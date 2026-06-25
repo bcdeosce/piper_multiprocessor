@@ -97,7 +97,7 @@ def _init_mix_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
-# ---------- VoicePool (cada worker TTS tem seu próprio pool) ----------
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
@@ -159,7 +159,7 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Função para obter o pool de vozes (dentro do worker TTS) ----------
+# ---------- Função para obter o pool de vozes ----------
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -172,7 +172,7 @@ def get_voice_pool(voice_name):
         cache[voice_name] = pool
     return cache[voice_name]
 
-# ---------- Síntese de um fragmento (texto) ----------
+# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -190,7 +190,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem usando FFmpeg (corrigida) ----------
+# ---------- Mixagem usando FFmpeg ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -199,7 +199,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     try:
         for data in segments_data:
             if 'pcm_bytes' in data:
-                # Cria um arquivo WAV com cabeçalho
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
                 with wave.open(wav_path, 'wb') as wav_file:
@@ -223,7 +222,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 continue
 
-        # Adicionar ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
@@ -252,8 +250,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         wav_bytes = result.stdout
 
         t_total = time.perf_counter() - t0
-        logger.debug(f"Mixagem FFmpeg concluída em {t_total:.3f}s | {len(temp_files)} arquivos")
-        return wav_bytes
+        return wav_bytes, t_total
 
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg erro: {e.stderr.decode()}")
@@ -275,8 +272,18 @@ def process_entire_request(
     effects: Dict[str, str],
     speakers: List[Dict],
     ambient_cfg: Dict,
-) -> bytes:
-    t_start = time.perf_counter()
+    enqueue_time: float,  # timestamp quando a tarefa foi enviada
+) -> Tuple[bytes, Dict[str, float]]:
+    """
+    Retorna (wav_bytes, metrics) onde metrics contém:
+        - queue_wait: tempo de espera na fila (desde o enqueue até o início)
+        - synth_time: soma do tempo de síntese de todos os fragmentos
+        - mix_time: tempo gasto na mixagem (FFmpeg)
+        - total_worker_time: tempo total dentro do worker (incluindo overhead)
+        - num_segments: número de segmentos processados
+    """
+    t_worker_start = time.perf_counter()
+    queue_wait = t_worker_start - enqueue_time
 
     is_dialog = bool(speakers)
     if not is_dialog:
@@ -296,6 +303,8 @@ def process_entire_request(
     parts = [p.strip() for p in parts if p.strip()]
 
     segments = []
+    synth_time_total = 0.0
+
     for part in parts:
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
@@ -319,15 +328,25 @@ def process_entire_request(
             ns = noise_scale
             nw = noise_w_scale
 
+        t_synth_start = time.perf_counter()
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
+        synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
 
-    # Mixagem (chamada síncrona dentro do mesmo worker)
-    wav_bytes = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
+    # Mixagem
+    wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
 
-    t_total = time.perf_counter() - t_start
-    logger.info(f"Worker TTS processou requisição em {t_total:.3f}s | {len(segments)} segmentos")
-    return wav_bytes
+    total_worker_time = time.perf_counter() - t_worker_start
+
+    metrics = {
+        'queue_wait': queue_wait,
+        'synth_time': synth_time_total,
+        'mix_time': mix_time,
+        'total_worker_time': total_worker_time,
+        'num_segments': len(segments),
+    }
+
+    return wav_bytes, metrics
 
 # ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(
@@ -365,7 +384,7 @@ class TTSRequest(BaseModel):
 # ---------- FastAPI ----------
 app = FastAPI(title="Piper TTS API (Requisição Inteira por Worker)")
 
-# ---------- Estatísticas ----------
+# ---------- Estatísticas (agora com múltiplas métricas) ----------
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
@@ -390,9 +409,12 @@ async def synthesize(req: TTSRequest):
     except AttributeError:
         ambient_dict = req.ambient.dict()
 
+    # Captura o timestamp antes de enviar para a fila
+    enqueue_time = time.perf_counter()
+
     loop = asyncio.get_running_loop()
     try:
-        wav_bytes = await loop.run_in_executor(
+        wav_bytes, metrics = await loop.run_in_executor(
             tts_pool,
             process_entire_request,
             req.voice,
@@ -402,20 +424,33 @@ async def synthesize(req: TTSRequest):
             req.noise_w_scale,
             req.effects,
             speakers_list,
-            ambient_dict
+            ambient_dict,
+            enqueue_time  # passa o timestamp para o worker
         )
     except Exception as e:
         logger.error(f"Erro no processamento: {e}")
         raise HTTPException(500, f"Falha no processamento: {str(e)}")
 
     t_total = time.perf_counter() - t_total_start
+
+    # Acumula todas as métricas
     async with stats_lock:
         stats['total'].append(t_total)
+        stats['queue_wait'].append(metrics['queue_wait'])
+        stats['synth_time'].append(metrics['synth_time'])
+        stats['mix_time'].append(metrics['mix_time'])
+        stats['total_worker_time'].append(metrics['total_worker_time'])
+        stats['num_segments'].append(metrics['num_segments'])
 
-    logger.info(f"⏱️ Requisição concluída em {t_total:.3f}s")
+    logger.info(
+        f"⏱️ Requisição concluída em {t_total:.3f}s | "
+        f"fila={metrics['queue_wait']:.3f}s | synth={metrics['synth_time']:.3f}s | "
+        f"mix={metrics['mix_time']:.3f}s | worker={metrics['total_worker_time']:.3f}s | "
+        f"segmentos={metrics['num_segments']}"
+    )
     return Response(content=wav_bytes, media_type="audio/wav")
 
-# ---------- Endpoint de estatísticas ----------
+# ---------- Endpoint de estatísticas (AGORA COM MÉTRICAS DETALHADAS) ----------
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
@@ -423,13 +458,21 @@ async def get_stats():
             return {"message": "Nenhuma requisição processada ainda."}
         report = {}
         for key, values in stats.items():
-            report[key] = {
-                "count": len(values),
-                "mean": sum(values) / len(values),
-                "min": min(values),
-                "max": max(values),
-                "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
-            }
+            if key == 'num_segments':
+                report[key] = {
+                    "count": len(values),
+                    "mean": sum(values) / len(values),
+                    "min": min(values),
+                    "max": max(values),
+                }
+            else:
+                report[key] = {
+                    "count": len(values),
+                    "mean": sum(values) / len(values),
+                    "min": min(values),
+                    "max": max(values),
+                    "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
+                }
         return report
 
 # ---------- Endpoints de saúde ----------
