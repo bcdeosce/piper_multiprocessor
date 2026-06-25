@@ -56,13 +56,14 @@ TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
 logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
-# ---------- Gerenciador de estatísticas por worker (compartilhado) ----------
-# Usamos um dicionário com lock para registrar cada worker
-worker_stats = {}
-worker_stats_lock = mp.Lock()
+# ---------- Gerenciador de estatísticas por worker (compartilhado entre processos) ----------
+# Usamos multiprocessing.Manager para criar um dicionário compartilhado
+manager = mp.Manager()
+worker_stats = manager.dict()  # dicionário compartilhado
+worker_stats_lock = mp.Lock()  # lock para acesso concorrente
 
 def register_worker(worker_type, worker_id, pid, cpu_id):
-    """Registra um worker no dicionário global."""
+    """Registra um worker no dicionário compartilhado."""
     with worker_stats_lock:
         key = f"{worker_type}_{worker_id}"
         worker_stats[key] = {
@@ -78,11 +79,11 @@ def update_worker_stats(worker_type, worker_id, request_time):
     with worker_stats_lock:
         key = f"{worker_type}_{worker_id}"
         if key in worker_stats:
-            worker_stats[key]["requests_processed"] += 1
-            worker_stats[key]["total_time"] += request_time
-            worker_stats[key]["avg_time"] = (
-                worker_stats[key]["total_time"] / worker_stats[key]["requests_processed"]
-            )
+            data = worker_stats[key]
+            data["requests_processed"] += 1
+            data["total_time"] += request_time
+            data["avg_time"] = data["total_time"] / data["requests_processed"]
+            worker_stats[key] = data  # atualiza o dicionário
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
@@ -104,8 +105,7 @@ def _init_tts_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade no TTS: {e}")
 
-    # Registra o worker
-    worker_id = cpu_id  # usamos o cpu_id como identificador
+    worker_id = cpu_id
     pid = os.getpid()
     register_worker("tts", worker_id, pid, cpu_id)
 
@@ -306,7 +306,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
-# ---------- Processamento de uma requisição inteira (dentro do worker TTS) ----------
+# ---------- Processamento de uma requisição inteira ----------
 def process_entire_request(
     voice_name: Optional[str],
     text: str,
@@ -373,10 +373,10 @@ def process_entire_request(
 
     total_worker_time = time.perf_counter() - t_worker_start
 
-    # Atualiza estatísticas do worker (identifica pelo PID e CPU ID)
+    # Atualiza estatísticas do worker
     try:
         cpu_id = os.sched_getaffinity(0)
-        cpu_id = next(iter(cpu_id))  # pega o primeiro (único) núcleo
+        cpu_id = next(iter(cpu_id))
         worker_id = cpu_id
         update_worker_stats("tts", worker_id, total_worker_time)
     except:
@@ -516,12 +516,11 @@ async def get_stats():
                 }
         return report
 
-# ---------- NOVO ENDPOINT: DIAGNÓSTICO POR WORKER ----------
+# ---------- Endpoint de diagnóstico por worker ----------
 @app.get("/workers")
 async def get_workers():
     """Retorna informações detalhadas de cada worker TTS e Mix."""
     with worker_stats_lock:
-        # Converte o dicionário para uma lista ordenada
         workers = []
         for key, data in worker_stats.items():
             worker_type, worker_id = key.split('_')
