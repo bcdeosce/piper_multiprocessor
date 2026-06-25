@@ -10,7 +10,7 @@ import wave
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import asyncio
 from collections import defaultdict
 
@@ -23,8 +23,8 @@ except ImportError:
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
 # ---------- Configuração de logs ----------
@@ -53,17 +53,19 @@ _cpu_lock = mp.Lock()
 
 # ---------- Workers (configuração via env) ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
-logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 20))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
 
-# ---------- Gerenciador de estatísticas por worker (compartilhado entre processos) ----------
-# Usamos multiprocessing.Manager para criar um dicionário compartilhado
+logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
+logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}, timeout: {REQUEST_TIMEOUT}s")
+
+# ---------- Gerenciador de estatísticas por worker (compartilhado) ----------
 manager = mp.Manager()
-worker_stats = manager.dict()  # dicionário compartilhado
-worker_stats_lock = mp.Lock()  # lock para acesso concorrente
+worker_stats = manager.dict()
+worker_stats_lock = mp.Lock()
 
 def register_worker(worker_type, worker_id, pid, cpu_id):
-    """Registra um worker no dicionário compartilhado."""
     with worker_stats_lock:
         key = f"{worker_type}_{worker_id}"
         worker_stats[key] = {
@@ -75,7 +77,6 @@ def register_worker(worker_type, worker_id, pid, cpu_id):
         }
 
 def update_worker_stats(worker_type, worker_id, request_time):
-    """Atualiza as estatísticas de um worker."""
     with worker_stats_lock:
         key = f"{worker_type}_{worker_id}"
         if key in worker_stats:
@@ -83,7 +84,7 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["requests_processed"] += 1
             data["total_time"] += request_time
             data["avg_time"] = data["total_time"] / data["requests_processed"]
-            worker_stats[key] = data  # atualiza o dicionário
+            worker_stats[key] = data
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
@@ -306,8 +307,8 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
-# ---------- Processamento de uma requisição inteira ----------
-def process_entire_request(
+# ---------- Processamento TTS (retorna segmentos) ----------
+def process_tts_only(
     voice_name: Optional[str],
     text: str,
     speed: float,
@@ -315,9 +316,9 @@ def process_entire_request(
     noise_w_scale: float,
     effects: Dict[str, str],
     speakers: List[Dict],
-    ambient_cfg: Dict,
     enqueue_time: float,
-) -> Tuple[bytes, Dict[str, float]]:
+) -> Tuple[List[Dict], Dict[str, float]]:
+    """Sintetiza os fragmentos, retorna segmentos e métricas de síntese."""
     t_worker_start = time.perf_counter()
     queue_wait = t_worker_start - enqueue_time
 
@@ -369,27 +370,48 @@ def process_entire_request(
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
 
-    wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
-
     total_worker_time = time.perf_counter() - t_worker_start
 
-    # Atualiza estatísticas do worker
+    # Atualiza estatísticas do worker TTS
     try:
         cpu_id = os.sched_getaffinity(0)
         cpu_id = next(iter(cpu_id))
-        worker_id = cpu_id
-        update_worker_stats("tts", worker_id, total_worker_time)
+        update_worker_stats("tts", cpu_id, total_worker_time)
     except:
         pass
 
     metrics = {
         'queue_wait': queue_wait,
         'synth_time': synth_time_total,
-        'mix_time': mix_time,
-        'total_worker_time': total_worker_time,
+        'tts_worker_time': total_worker_time,
         'num_segments': len(segments),
     }
 
+    return segments, metrics
+
+# ---------- Processamento completo (TTS + Mix) ----------
+def process_full_request(
+    voice_name: Optional[str],
+    text: str,
+    speed: float,
+    noise_scale: float,
+    noise_w_scale: float,
+    effects: Dict[str, str],
+    speakers: List[Dict],
+    ambient_cfg: Dict,
+    enqueue_time: float,
+) -> Tuple[bytes, Dict[str, float]]:
+    """Versão unificada (antiga) – mantida para compatibilidade."""
+    segments, tts_metrics = process_tts_only(
+        voice_name, text, speed, noise_scale, noise_w_scale,
+        effects, speakers, enqueue_time
+    )
+    wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
+    metrics = {
+        **tts_metrics,
+        'mix_time': mix_time,
+        'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
+    }
     return wav_bytes, metrics
 
 # ---------- Pools de processos ----------
@@ -401,6 +423,9 @@ mix_pool = ProcessPoolExecutor(
     max_workers=MIX_WORKERS,
     initializer=_init_mix_worker
 )
+
+# ---------- Semáforo para controlar concorrência ----------
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 # ---------- Modelos Pydantic ----------
 class AmbientConfig(BaseModel):
@@ -426,74 +451,121 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Diagnóstico por Worker)")
+app = FastAPI(title="Piper TTS API (Otimizada com Diagnóstico)")
 
 # ---------- Estatísticas agregadas ----------
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
+# ---------- Endpoint principal com timeouts e semáforo ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
-    t_total_start = time.perf_counter()
+    # Limita o número de requisições simultâneas
+    async with request_semaphore:
+        t_total_start = time.perf_counter()
 
-    speakers_list = []
-    if req.speakers:
-        for spk in req.speakers:
-            speakers_list.append({
-                'role': spk.role,
-                'voice': spk.voice,
-                'speed': spk.speed,
-                'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
-                'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
-            })
+        # Prepara dados
+        speakers_list = []
+        if req.speakers:
+            for spk in req.speakers:
+                speakers_list.append({
+                    'role': spk.role,
+                    'voice': spk.voice,
+                    'speed': spk.speed,
+                    'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
+                    'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
+                })
 
-    try:
-        ambient_dict = req.ambient.model_dump()
-    except AttributeError:
-        ambient_dict = req.ambient.dict()
+        try:
+            ambient_dict = req.ambient.model_dump()
+        except AttributeError:
+            ambient_dict = req.ambient.dict()
 
-    enqueue_time = time.perf_counter()
-    loop = asyncio.get_running_loop()
+        enqueue_time = time.perf_counter()
+        loop = asyncio.get_running_loop()
 
-    try:
-        wav_bytes, metrics = await loop.run_in_executor(
-            tts_pool,
-            process_entire_request,
-            req.voice,
-            req.text,
-            req.speed,
-            req.noise_scale,
-            req.noise_w_scale,
-            req.effects,
-            speakers_list,
-            ambient_dict,
-            enqueue_time
+        # --- Etapa 1: TTS (síntese) ---
+        t_tts_start = time.perf_counter()
+        try:
+            # Executa TTS com timeout
+            tts_future = loop.run_in_executor(
+                tts_pool,
+                process_tts_only,
+                req.voice,
+                req.text,
+                req.speed,
+                req.noise_scale,
+                req.noise_w_scale,
+                req.effects,
+                speakers_list,
+                enqueue_time
+            )
+            segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
+        except TimeoutError:
+            logger.error("Timeout na síntese TTS")
+            raise HTTPException(504, "TTS synthesis timeout")
+        t_tts = time.perf_counter() - t_tts_start
+
+        # --- Etapa 2: Mixagem ---
+        t_mix_start = time.perf_counter()
+        try:
+            mix_future = loop.run_in_executor(
+                mix_pool,
+                mix_and_export_task,
+                segments,
+                ambient_dict,
+                22050
+            )
+            wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
+        except TimeoutError:
+            logger.error("Timeout na mixagem")
+            raise HTTPException(504, "Mix timeout")
+        t_mix = time.perf_counter() - t_mix_start
+
+        # --- Agrega métricas ---
+        total_time = time.perf_counter() - t_total_start
+        metrics = {
+            'queue_wait': tts_metrics['queue_wait'],
+            'synth_time': tts_metrics['synth_time'],
+            'mix_time': mix_time,
+            'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
+            'num_segments': tts_metrics['num_segments'],
+            'tts_worker_time': tts_metrics['tts_worker_time'],
+        }
+
+        # Atualiza estatísticas do worker de mixagem
+        try:
+            # O worker de mixagem não sabe qual núcleo, mas podemos obter do processo atual
+            cpu_id = os.sched_getaffinity(0)
+            cpu_id = next(iter(cpu_id))
+            update_worker_stats("mix", cpu_id, mix_time)
+        except:
+            pass
+
+        # Atualiza estatísticas agregadas
+        async with stats_lock:
+            stats['total'].append(total_time)
+            stats['queue_wait'].append(metrics['queue_wait'])
+            stats['synth_time'].append(metrics['synth_time'])
+            stats['mix_time'].append(metrics['mix_time'])
+            stats['total_worker_time'].append(metrics['total_worker_time'])
+            stats['num_segments'].append(metrics['num_segments'])
+            stats['tts_worker_time'].append(metrics['tts_worker_time'])
+
+        logger.info(
+            f"⏱️ Requisição: total={total_time:.3f}s | "
+            f"fila={metrics['queue_wait']:.3f}s | synth={metrics['synth_time']:.3f}s | "
+            f"mix={metrics['mix_time']:.3f}s | tts_worker={metrics['tts_worker_time']:.3f}s | "
+            f"segmentos={metrics['num_segments']}"
         )
-    except Exception as e:
-        logger.error(f"Erro no processamento: {e}")
-        raise HTTPException(500, f"Falha no processamento: {str(e)}")
 
-    t_total = time.perf_counter() - t_total_start
+        return Response(content=wav_bytes, media_type="audio/wav")
 
-    async with stats_lock:
-        stats['total'].append(t_total)
-        stats['queue_wait'].append(metrics['queue_wait'])
-        stats['synth_time'].append(metrics['synth_time'])
-        stats['mix_time'].append(metrics['mix_time'])
-        stats['total_worker_time'].append(metrics['total_worker_time'])
-        stats['num_segments'].append(metrics['num_segments'])
+# ---------- Endpoints de diagnóstico ----------
 
-    logger.info(
-        f"⏱️ Requisição concluída em {t_total:.3f}s | "
-        f"fila={metrics['queue_wait']:.3f}s | synth={metrics['synth_time']:.3f}s | "
-        f"mix={metrics['mix_time']:.3f}s | worker={metrics['total_worker_time']:.3f}s | "
-        f"segmentos={metrics['num_segments']}"
-    )
-    return Response(content=wav_bytes, media_type="audio/wav")
-
-# ---------- Endpoint de estatísticas agregadas ----------
 @app.get("/stats")
 async def get_stats():
+    """Métricas agregadas de todas as requisições."""
     async with stats_lock:
         if not stats['total']:
             return {"message": "Nenhuma requisição processada ainda."}
@@ -516,10 +588,9 @@ async def get_stats():
                 }
         return report
 
-# ---------- Endpoint de diagnóstico por worker ----------
 @app.get("/workers")
 async def get_workers():
-    """Retorna informações detalhadas de cada worker TTS e Mix."""
+    """Estado detalhado de cada worker TTS e Mix."""
     with worker_stats_lock:
         workers = []
         for key, data in worker_stats.items():
@@ -538,6 +609,41 @@ async def get_workers():
             "tts_workers": [w for w in workers if w["type"] == "tts"],
             "mix_workers": [w for w in workers if w["type"] == "mix"],
         }
+
+@app.get("/pool_status")
+async def pool_status():
+    """Informações sobre os pools e filas (estimativa)."""
+    # O ProcessPoolExecutor não expõe o tamanho da fila diretamente.
+    # Mas podemos estimar com base no número de workers e nas métricas.
+    # Usamos o número de workers registrados como proxy.
+    with worker_stats_lock:
+        tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
+        mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
+    return {
+        "tts_workers": TTS_WORKERS,
+        "mix_workers": MIX_WORKERS,
+        "tts_registered": tts_count,
+        "mix_registered": mix_count,
+        "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+        "request_timeout": REQUEST_TIMEOUT,
+        "current_concurrency": request_semaphore._value if hasattr(request_semaphore, '_value') else "unknown",
+    }
+
+@app.post("/reset_stats")
+async def reset_stats():
+    """Reseta todas as estatísticas (requisições e workers)."""
+    async with stats_lock:
+        for key in stats:
+            stats[key].clear()
+    with worker_stats_lock:
+        for key in list(worker_stats.keys()):
+            # Reseta contadores mas mantém os workers registrados
+            data = worker_stats[key]
+            data["requests_processed"] = 0
+            data["total_time"] = 0.0
+            data["avg_time"] = 0.0
+            worker_stats[key] = data
+    return {"message": "Estatísticas resetadas com sucesso."}
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
@@ -559,9 +665,12 @@ async def health():
     return {
         "status": "ok",
         "voices": list(VOICE_PATHS.keys()),
-        "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS}
+        "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
+        "concurrency_limit": MAX_CONCURRENT_REQUESTS,
+        "timeout": REQUEST_TIMEOUT,
     }
 
+# ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
