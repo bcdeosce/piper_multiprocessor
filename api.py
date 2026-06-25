@@ -54,7 +54,7 @@ _cpu_lock = mp.Lock()
 # ---------- Workers (configuração otimizada) ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
-logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
+logger.info(f"api nova! Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
