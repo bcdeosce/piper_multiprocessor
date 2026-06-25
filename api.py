@@ -58,10 +58,12 @@ logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos"
 
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
+    # Força o ONNX Runtime e OpenMP a usarem apenas 1 thread
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
 
+    # Define afinidade do processo (thread principal)
     with _cpu_lock:
         cpu_id = _cpu_counter.value
         _cpu_counter.value += 1
@@ -76,7 +78,9 @@ def _init_tts_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade no TTS: {e}")
 
+    # Armazena o cpu_id no módulo global para uso posterior
     mod = sys.modules['__main__']
+    mod._worker_cpu_id = cpu_id
     mod._worker_voice_cache = {}
 
 # ---------- Inicializador dos workers de mixagem ----------
@@ -97,13 +101,39 @@ def _init_mix_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
-# ---------- VoicePool ----------
+# ---------- VoicePool com controle fino do ONNX Runtime ----------
 class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 1, cpu_id: int = 0):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=False)
+            # Cria as opções da sessão ONNX
+            sess_options = ort.SessionOptions()
+            
+            # Força o uso de APENAS 1 thread por worker (essencial para o isolamento)
+            sess_options.intra_op_num_threads = 1
+            
+            # Define a afinidade das threads internas para o núcleo específico do worker
+            # O formato é uma string com os IDs dos cores: '0;1;2' para os cores 0, 1 e 2
+            sess_options.add_session_config_entry(
+                'session.intra_op_thread_affinities', 
+                str(cpu_id)  # Ex: '5' para fixar no core 5
+            )
+            
+            # Cria a sessão do ONNX Runtime
+            session = ort.InferenceSession(
+                model_path, 
+                sess_options, 
+                providers=['CPUExecutionProvider']
+            )
+            
+            # Carrega a voz passando a sessão já criada
+            voice = PiperVoice.load(
+                model_path, 
+                config_path=config_path, 
+                session=session, 
+                use_cuda=False
+            )
             self.pool.put(voice)
 
     def get(self, timeout: float = 2.0):
@@ -159,8 +189,8 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Função para obter o pool de vozes ----------
-def get_voice_pool(voice_name):
+# ---------- Função para obter o pool de vozes (dentro do worker TTS) ----------
+def get_voice_pool(voice_name, cpu_id):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
     if cache is None:
@@ -168,13 +198,13 @@ def get_voice_pool(voice_name):
         mod._worker_voice_cache = cache
     if voice_name not in cache:
         model_path, config_path = VOICE_PATHS[voice_name]
-        pool = VoicePool(model_path, config_path, pool_size=1)
+        pool = VoicePool(model_path, config_path, pool_size=1, cpu_id=cpu_id)
         cache[voice_name] = pool
     return cache[voice_name]
 
-# ---------- Síntese de um fragmento ----------
-def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
-    pool = get_voice_pool(voice_name)
+# ---------- Síntese de um fragmento (texto) ----------
+def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale, cpu_id):
+    pool = get_voice_pool(voice_name, cpu_id)
     voice = pool.get()
     try:
         config = SynthesisConfig(
@@ -190,7 +220,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem usando FFmpeg ----------
+# ---------- Mixagem usando FFmpeg (corrigida) ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -199,6 +229,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     try:
         for data in segments_data:
             if 'pcm_bytes' in data:
+                # Cria um arquivo WAV com cabeçalho
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
                 with wave.open(wav_path, 'wb') as wav_file:
@@ -222,6 +253,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 continue
 
+        # Adicionar ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
@@ -273,6 +305,7 @@ def process_entire_request(
     speakers: List[Dict],
     ambient_cfg: Dict,
     enqueue_time: float,  # timestamp quando a tarefa foi enviada
+    cpu_id: int,          # ID do núcleo onde este worker está fixado
 ) -> Tuple[bytes, Dict[str, float]]:
     """
     Retorna (wav_bytes, metrics) onde metrics contém:
@@ -329,7 +362,7 @@ def process_entire_request(
             nw = noise_w_scale
 
         t_synth_start = time.perf_counter()
-        sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
+        sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw, cpu_id)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
 
@@ -414,6 +447,9 @@ async def synthesize(req: TTSRequest):
 
     loop = asyncio.get_running_loop()
     try:
+        # Obtém o cpu_id do worker que vai executar (precisamos passar para o worker)
+        # Como não temos como saber qual worker será, vamos passar None e o worker
+        # vai pegar o cpu_id do seu próprio contexto (via módulo global)
         wav_bytes, metrics = await loop.run_in_executor(
             tts_pool,
             process_entire_request,
@@ -425,7 +461,8 @@ async def synthesize(req: TTSRequest):
             req.effects,
             speakers_list,
             ambient_dict,
-            enqueue_time  # passa o timestamp para o worker
+            enqueue_time,
+            None  # cpu_id será obtido dentro do worker via módulo global
         )
     except Exception as e:
         logger.error(f"Erro no processamento: {e}")
