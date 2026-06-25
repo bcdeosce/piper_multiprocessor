@@ -51,19 +51,45 @@ EFFECTS_DIR.mkdir(exist_ok=True)
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
-# ---------- Workers (configuração otimizada) ----------
+# ---------- Workers (configuração via env) ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
 logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
+# ---------- Gerenciador de estatísticas por worker (compartilhado) ----------
+# Usamos um dicionário com lock para registrar cada worker
+worker_stats = {}
+worker_stats_lock = mp.Lock()
+
+def register_worker(worker_type, worker_id, pid, cpu_id):
+    """Registra um worker no dicionário global."""
+    with worker_stats_lock:
+        key = f"{worker_type}_{worker_id}"
+        worker_stats[key] = {
+            "pid": pid,
+            "cpu_id": cpu_id,
+            "requests_processed": 0,
+            "total_time": 0.0,
+            "avg_time": 0.0,
+        }
+
+def update_worker_stats(worker_type, worker_id, request_time):
+    """Atualiza as estatísticas de um worker."""
+    with worker_stats_lock:
+        key = f"{worker_type}_{worker_id}"
+        if key in worker_stats:
+            worker_stats[key]["requests_processed"] += 1
+            worker_stats[key]["total_time"] += request_time
+            worker_stats[key]["avg_time"] = (
+                worker_stats[key]["total_time"] / worker_stats[key]["requests_processed"]
+            )
+
 # ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
-    # CRÍTICO: Força o ONNX Runtime e OpenMP a usarem APENAS 1 thread
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
 
-    # Define afinidade do processo (thread principal)
     with _cpu_lock:
         cpu_id = _cpu_counter.value
         _cpu_counter.value += 1
@@ -78,13 +104,16 @@ def _init_tts_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade no TTS: {e}")
 
-    # Armazena o cpu_id para uso posterior
+    # Registra o worker
+    worker_id = cpu_id  # usamos o cpu_id como identificador
+    pid = os.getpid()
+    register_worker("tts", worker_id, pid, cpu_id)
+
     mod = sys.modules['__main__']
     mod._worker_cpu_id = cpu_id
     mod._worker_voice_cache = {}
 
-    # Log para confirmar que está com 1 thread
-    logger.info(f"TTS Worker {cpu_id} configurado com OMP_NUM_THREADS=1 e ORT_NUM_THREADS=1")
+    logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
 
 # ---------- Inicializador dos workers de mixagem ----------
 def _init_mix_worker():
@@ -104,14 +133,16 @@ def _init_mix_worker():
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
-# ---------- VoicePool (agora sem passar session, confiando nas variáveis de ambiente) ----------
+    worker_id = cpu_id
+    pid = os.getpid()
+    register_worker("mix", worker_id, pid, cpu_id)
+
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            # O Piper cria a sessão internamente, mas as variáveis de ambiente
-            # OMP_NUM_THREADS=1 e ORT_NUM_THREADS=1 garantem que ela use 1 thread
             voice = PiperVoice.load(
                 model_path,
                 config_path=config_path,
@@ -172,7 +203,7 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Função para obter o pool de vozes (dentro do worker TTS) ----------
+# ---------- Função para obter o pool de vozes ----------
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -185,7 +216,7 @@ def get_voice_pool(voice_name):
         cache[voice_name] = pool
     return cache[voice_name]
 
-# ---------- Síntese de um fragmento (texto) ----------
+# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -203,7 +234,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem usando FFmpeg (corrigida) ----------
+# ---------- Mixagem usando FFmpeg ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -212,7 +243,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     try:
         for data in segments_data:
             if 'pcm_bytes' in data:
-                # Cria um arquivo WAV com cabeçalho
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
                 with wave.open(wav_path, 'wb') as wav_file:
@@ -236,7 +266,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 continue
 
-        # Adicionar ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
@@ -287,16 +316,8 @@ def process_entire_request(
     effects: Dict[str, str],
     speakers: List[Dict],
     ambient_cfg: Dict,
-    enqueue_time: float,  # timestamp quando a tarefa foi enviada
+    enqueue_time: float,
 ) -> Tuple[bytes, Dict[str, float]]:
-    """
-    Retorna (wav_bytes, metrics) onde metrics contém:
-        - queue_wait: tempo de espera na fila (desde o enqueue até o início)
-        - synth_time: soma do tempo de síntese de todos os fragmentos
-        - mix_time: tempo gasto na mixagem (FFmpeg)
-        - total_worker_time: tempo total dentro do worker (incluindo overhead)
-        - num_segments: número de segmentos processados
-    """
     t_worker_start = time.perf_counter()
     queue_wait = t_worker_start - enqueue_time
 
@@ -348,10 +369,18 @@ def process_entire_request(
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
 
-    # Mixagem
     wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
 
     total_worker_time = time.perf_counter() - t_worker_start
+
+    # Atualiza estatísticas do worker (identifica pelo PID e CPU ID)
+    try:
+        cpu_id = os.sched_getaffinity(0)
+        cpu_id = next(iter(cpu_id))  # pega o primeiro (único) núcleo
+        worker_id = cpu_id
+        update_worker_stats("tts", worker_id, total_worker_time)
+    except:
+        pass
 
     metrics = {
         'queue_wait': queue_wait,
@@ -397,9 +426,9 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Requisição Inteira por Worker)")
+app = FastAPI(title="Piper TTS API (Diagnóstico por Worker)")
 
-# ---------- Estatísticas (agora com múltiplas métricas) ----------
+# ---------- Estatísticas agregadas ----------
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
@@ -407,7 +436,6 @@ stats_lock = asyncio.Lock()
 async def synthesize(req: TTSRequest):
     t_total_start = time.perf_counter()
 
-    # Converter speakers para lista de dicionários
     speakers_list = []
     if req.speakers:
         for spk in req.speakers:
@@ -424,10 +452,9 @@ async def synthesize(req: TTSRequest):
     except AttributeError:
         ambient_dict = req.ambient.dict()
 
-    # Captura o timestamp antes de enviar para a fila
     enqueue_time = time.perf_counter()
-
     loop = asyncio.get_running_loop()
+
     try:
         wav_bytes, metrics = await loop.run_in_executor(
             tts_pool,
@@ -448,7 +475,6 @@ async def synthesize(req: TTSRequest):
 
     t_total = time.perf_counter() - t_total_start
 
-    # Acumula todas as métricas
     async with stats_lock:
         stats['total'].append(t_total)
         stats['queue_wait'].append(metrics['queue_wait'])
@@ -465,7 +491,7 @@ async def synthesize(req: TTSRequest):
     )
     return Response(content=wav_bytes, media_type="audio/wav")
 
-# ---------- Endpoint de estatísticas (AGORA COM MÉTRICAS DETALHADAS) ----------
+# ---------- Endpoint de estatísticas agregadas ----------
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
@@ -489,6 +515,30 @@ async def get_stats():
                     "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
                 }
         return report
+
+# ---------- NOVO ENDPOINT: DIAGNÓSTICO POR WORKER ----------
+@app.get("/workers")
+async def get_workers():
+    """Retorna informações detalhadas de cada worker TTS e Mix."""
+    with worker_stats_lock:
+        # Converte o dicionário para uma lista ordenada
+        workers = []
+        for key, data in worker_stats.items():
+            worker_type, worker_id = key.split('_')
+            workers.append({
+                "type": worker_type,
+                "id": int(worker_id),
+                "pid": data["pid"],
+                "cpu_id": data["cpu_id"],
+                "requests_processed": data["requests_processed"],
+                "avg_time": data["avg_time"],
+            })
+        workers.sort(key=lambda x: (x["type"], x["id"]))
+        return {
+            "total_workers": len(workers),
+            "tts_workers": [w for w in workers if w["type"] == "tts"],
+            "mix_workers": [w for w in workers if w["type"] == "mix"],
+        }
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
