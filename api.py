@@ -6,11 +6,13 @@ import time
 import json
 import logging
 import subprocess
+import tempfile
 import multiprocessing as mp
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor
 import asyncio
+from collections import defaultdict
 
 # ---------- Instalação automática do Piper (se necessário) ----------
 try:
@@ -24,7 +26,6 @@ import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from pydub import AudioSegment
 
 # ---------- Configuração de logs ----------
 logging.basicConfig(
@@ -33,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("piper-api")
 
-# ---------- Forçar CPU (sem CUDA) ----------
+# ---------- Forçar CPU ----------
 ort.set_default_logger_severity(3)
 
 # ---------- Diretórios ----------
@@ -46,49 +47,40 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Contador global para atribuição de núcleos ----------
-# Cada processo filho incrementa este contador com lock para pegar o próximo núcleo.
+# ---------- Contador global para afinidade de núcleos ----------
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
-# ---------- Workers (ajuste conforme seus núcleos) ----------
-# Para 16 vCPUs, sugiro 14 para TTS, 1 para mixagem, 1 para o FastAPI/OS.
-# Se quiser usar TODOS os 16, ajuste TTS_WORKERS=15 e MIX_WORKERS=1 (soma=16)
-TTS_WORKERS = int(os.getenv("TTS_WORKERS", 14))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", 1))
+# ---------- Workers (configuração otimizada) ----------
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
 logger.info(f"Workers: TTS={TTS_WORKERS} processos, Mix={MIX_WORKERS} processos")
 
-# ---------- Inicializador dos workers TTS (executado em cada processo) ----------
+# ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
-    # 1. Limita o ONNX Runtime e o OpenMP a 1 thread por processo
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
 
-    # 2. Define afinidade de CPU (core isolation) – apenas Linux
     with _cpu_lock:
         cpu_id = _cpu_counter.value
         _cpu_counter.value += 1
 
     total_cpus = os.cpu_count()
     if cpu_id >= total_cpus:
-        cpu_id = cpu_id % total_cpus  # round-robin se houver mais workers que núcleos
+        cpu_id = cpu_id % total_cpus
 
     try:
         os.sched_setaffinity(0, {cpu_id})
         logger.info(f"TTS Worker fixado ao núcleo {cpu_id}")
-    except AttributeError:
-        logger.warning("sched_setaffinity não suportado (não é Linux). Ignorando.")
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade no TTS: {e}")
 
-    # 3. Cache de vozes por processo
     mod = sys.modules['__main__']
     mod._worker_voice_cache = {}
 
 # ---------- Inicializador dos workers de mixagem ----------
 def _init_mix_worker():
-    # Limita threads de bibliotecas que eventualmente usem OpenMP
     os.environ["OMP_NUM_THREADS"] = "1"
 
     with _cpu_lock:
@@ -102,12 +94,10 @@ def _init_mix_worker():
     try:
         os.sched_setaffinity(0, {cpu_id})
         logger.info(f"Mix Worker fixado ao núcleo {cpu_id}")
-    except AttributeError:
-        logger.warning("sched_setaffinity não suportado (não é Linux). Ignorando.")
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
-# ---------- VoicePool (pool de instâncias PiperVoice) ----------
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
         import queue
@@ -169,40 +159,43 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Caches de efeitos e ambiente (processo principal) ----------
-effect_cache: Dict[Tuple[str, str], AudioSegment] = {}
-ambient_cache: Dict[Tuple[str, float], AudioSegment] = {}
+# ---------- Caches para efeitos e ambiente (processo principal) ----------
+effect_cache: Dict[Tuple[str, str], bytes] = {}
+ambient_cache: Dict[Tuple[str, float], bytes] = {}
 
-def load_effect(voice_name, effect_file):
+def load_effect_bytes(voice_name: str, effect_file: str) -> bytes:
     cache_key = (voice_name, effect_file)
     if cache_key in effect_cache:
         return effect_cache[cache_key]
+
     voice_dir = VOICES_DIR / voice_name
     effect_path = voice_dir / effect_file
     if not effect_path.exists():
         effect_path = EFFECTS_DIR / effect_file
     if not effect_path.exists():
         raise FileNotFoundError(f"Efeito '{effect_file}' não encontrado")
-    seg = AudioSegment.from_wav(str(effect_path))
-    effect_cache[cache_key] = seg
-    return seg
 
-def load_ambient(ambient_file, volume_db):
+    with open(effect_path, 'rb') as f:
+        data = f.read()
+    effect_cache[cache_key] = data
+    return data
+
+def load_ambient_bytes(ambient_file: str, volume_db: float) -> bytes:
     cache_key = (ambient_file, volume_db)
     if cache_key in ambient_cache:
         return ambient_cache[cache_key]
+
     ambient_path = AMBIENT_DIR / f"{ambient_file}.wav"
     if not ambient_path.exists():
         raise FileNotFoundError(f"Ambiente '{ambient_file}.wav' não encontrado")
-    seg = AudioSegment.from_wav(str(ambient_path))
-    seg = seg + volume_db
-    ambient_cache[cache_key] = seg
-    return seg
+
+    with open(ambient_path, 'rb') as f:
+        data = f.read()
+    ambient_cache[cache_key] = data
+    return data
 
 # ---------- Funções executadas nos workers ----------
-
 def get_voice_pool(voice_name):
-    """Retorna um pool de vozes para o processo atual (cache local)."""
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
     if cache is None:
@@ -210,12 +203,11 @@ def get_voice_pool(voice_name):
         mod._worker_voice_cache = cache
     if voice_name not in cache:
         model_path, config_path = VOICE_PATHS[voice_name]
-        pool = VoicePool(model_path, config_path, pool_size=1)  # pool_size=1 para manter simplicidade
+        pool = VoicePool(model_path, config_path, pool_size=1)
         cache[voice_name] = pool
     return cache[voice_name]
 
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
-    """Sintetiza um trecho de texto e retorna (sample_rate, pcm_bytes)."""
     pool = get_voice_pool(voice_name)
     voice = pool.get()
     try:
@@ -234,69 +226,81 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
 
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     """
-    Recebe segmentos (PCM ou efeitos), mixa, aplica ambiente (se configurado),
-    normaliza e exporta para WAV (PCM 16-bit mono).
-    Retorna bytes do arquivo WAV.
+    Mixa múltiplos segmentos usando FFmpeg (único comando) e retorna bytes WAV.
     """
-    # Monta segmentos padronizados (mono, 16-bit, target_rate)
-    audio_segments = []
-    for data in segments_data:
-        if 'pcm_bytes' in data:
-            seg = AudioSegment(
-                data=data['pcm_bytes'],
-                sample_width=2,
-                frame_rate=data['sample_rate'],
-                channels=1
-            )
-        elif 'effect' in data:
-            voice_dir = VOICES_DIR / data['voice']
-            effect_path = voice_dir / data['effect']
-            if not effect_path.exists():
-                effect_path = EFFECTS_DIR / data['effect']
-            seg = AudioSegment.from_wav(str(effect_path))
-        else:
-            continue
-        seg = seg.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
-        audio_segments.append(seg)
+    t0 = time.perf_counter()
+    temp_files = []
+    ffmpeg_cmd = ["ffmpeg", "-y"]
 
-    if not audio_segments:
-        raise ValueError("Nenhum segmento para mixagem")
+    try:
+        # 1. Prepara arquivos temporários para cada segmento
+        for data in segments_data:
+            if 'pcm_bytes' in data:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    f.write(data['pcm_bytes'])
+                    temp_files.append(f.name)
+            elif 'effect' in data:
+                # Efeito já está em cache no processo principal, mas aqui precisamos do arquivo.
+                # Como estamos no worker, não temos o cache. Carregamos do disco.
+                voice_dir = VOICES_DIR / data['voice']
+                effect_path = voice_dir / data['effect']
+                if not effect_path.exists():
+                    effect_path = EFFECTS_DIR / data['effect']
+                if not effect_path.exists():
+                    raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
+                # Copia para temp para padronizar
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    with open(effect_path, 'rb') as src:
+                        f.write(src.read())
+                    temp_files.append(f.name)
+            else:
+                continue
 
-    combined = AudioSegment.empty()
-    for seg in audio_segments:
-        combined += seg
-
-    # Normalização para -20 dBFS
-    target_dBFS = -20.0
-    if combined.dBFS != target_dBFS:
-        combined = combined.apply_gain(target_dBFS - combined.dBFS)
-
-    # Ambiente com cache local ao processo (usando atributo estático)
-    if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
-        cache_key = (ambient_cfg['file'], ambient_cfg.get('volume_db', -15))
-        # Cache local no processo (não compartilhado entre processos)
-        if not hasattr(mix_and_export_task, '_ambient_cache'):
-            mix_and_export_task._ambient_cache = {}
-        if cache_key not in mix_and_export_task._ambient_cache:
+        # 2. Adiciona ambiente, se habilitado
+        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            ambient = AudioSegment.from_wav(str(ambient_path))
-            ambient = ambient + ambient_cfg.get('volume_db', -15)
-            ambient = ambient.set_channels(1).set_sample_width(2).set_frame_rate(target_rate)
-            mix_and_export_task._ambient_cache[cache_key] = ambient
-        ambient = mix_and_export_task._ambient_cache[cache_key]
+            if ambient_path.exists():
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    with open(ambient_path, 'rb') as src:
+                        f.write(src.read())
+                    temp_files.append(f.name)
 
-        if len(ambient) < len(combined):
-            ambient = ambient * ((len(combined) // len(ambient)) + 1)
-        ambient = ambient[:len(combined)]
-        combined = combined.overlay(ambient)
+        if not temp_files:
+            raise ValueError("Nenhum arquivo para mixar")
 
-    # Exporta para WAV em memória
-    output = io.BytesIO()
-    combined.export(output, format="wav")
-    wav_bytes = output.getvalue()
-    return wav_bytes
+        # 3. Monta comando FFmpeg
+        for f in temp_files:
+            ffmpeg_cmd.extend(["-i", f])
 
-# ---------- Pools de processos com isolamento de núcleos ----------
+        filter_complex = f"amix=inputs={len(temp_files)}:duration=longest"
+        ffmpeg_cmd.extend([
+            "-filter_complex", filter_complex,
+            "-ar", str(target_rate),
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            "-f", "wav",
+            "pipe:1"
+        ])
+
+        # 4. Executa
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+        wav_bytes = result.stdout
+
+        t_total = time.perf_counter() - t0
+        logger.debug(f"Mixagem FFmpeg concluída em {t_total:.3f}s | {len(temp_files)} arquivos")
+        return wav_bytes
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg erro: {e.stderr.decode()}")
+        raise RuntimeError("Falha na mixagem com FFmpeg")
+    finally:
+        for f in temp_files:
+            try:
+                os.unlink(f)
+            except:
+                pass
+
+# ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
     initializer=_init_tts_worker
@@ -330,17 +334,23 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Core Isolation + WAV)")
+app = FastAPI(title="Piper TTS API (Otimizada + FFmpeg)")
+
+# ---------- Estatísticas acumuladas para relatório ----------
+stats = defaultdict(list)
+stats_lock = asyncio.Lock()
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
+    global stats
     t_total_start = time.perf_counter()
 
-    # --- Validação e mapeamento de speakers ---
+    # --- 1. Parse e validação ---
+    t_parse_start = time.perf_counter()
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
-            raise HTTPException(400, "Campo 'voice' é obrigatório quando não há speakers.")
+            raise HTTPException(400, "Campo 'voice' é obrigatório")
         if req.voice not in VOICE_PATHS:
             raise HTTPException(404, f"Voz '{req.voice}' não encontrada")
         speaker_map = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
@@ -356,30 +366,33 @@ async def synthesize(req: TTSRequest):
                 raise HTTPException(404, f"Voz '{v}' (speaker '{role}') não encontrada")
         current_role = None
 
-    # --- Divisão do texto em partes (diálogo, texto, efeitos) ---
+    t_parse = time.perf_counter() - t_parse_start
+
+    # --- 2. Divisão do texto ---
+    t_split_start = time.perf_counter()
     parts = re.split(r'(\[.*?\])', req.text)
     parts = [p.strip() for p in parts if p.strip()]
+    t_split = time.perf_counter() - t_split_start
 
+    # --- 3. Preparação das tarefas TTS e mix ---
+    t_prep_start = time.perf_counter()
     tts_tasks = []
     segment_data = [None] * len(parts)
     loop = asyncio.get_running_loop()
 
     for idx, part in enumerate(parts):
-        # Detecta marcador de papel (ex: [joao])
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
             continue
 
-        # Verifica se é um efeito sonoro (ex: "tosse", "porta")
         if part in req.effects:
             effect_file = req.effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
             segment_data[idx] = {'effect': effect_file, 'voice': voice_for_eff}
             continue
 
-        # Síntese TTS
         if is_dialog:
             if current_role is None:
                 raise HTTPException(400, "Speaker não definido. Use [papel] antes do texto.")
@@ -394,25 +407,28 @@ async def synthesize(req: TTSRequest):
                                    voice_name, part, speed, noise_s, noise_w)
         tts_tasks.append((fut, idx))
 
-    # --- Executa todas as sínteses em paralelo ---
-    t_synth_start = time.perf_counter()
+    t_prep = time.perf_counter() - t_prep_start
+
+    # --- 4. Execução das sínteses em paralelo ---
+    t_synth_total_start = time.perf_counter()
+    synth_times = []
     if tts_tasks:
         futures, indices = zip(*tts_tasks)
         results = await asyncio.gather(*futures)
         for (sr, pcm), idx in zip(results, indices):
             segment_data[idx] = {'pcm_bytes': pcm, 'sample_rate': sr}
-    t_synth_end = time.perf_counter()
+    t_synth_total = time.perf_counter() - t_synth_total_start
 
-    # --- Prepara payload para mixagem ---
+    # --- 5. Preparação do payload para mixagem ---
+    t_mix_prep_start = time.perf_counter()
     mix_payload = [d for d in segment_data if d is not None]
-
-    # Serialização compatível Pydantic v1/v2
     try:
         ambient_dict = req.ambient.model_dump()
     except AttributeError:
         ambient_dict = req.ambient.dict()
+    t_mix_prep = time.perf_counter() - t_mix_prep_start
 
-    # --- Mixagem e exportação WAV ---
+    # --- 6. Mixagem e exportação ---
     t_mix_start = time.perf_counter()
     try:
         wav_bytes = await loop.run_in_executor(mix_pool, mix_and_export_task,
@@ -420,20 +436,47 @@ async def synthesize(req: TTSRequest):
     except Exception as e:
         logger.error(f"Falha na mixagem/exportação: {e}")
         raise HTTPException(500, f"Erro na mixagem: {str(e)}")
-    t_mix_end = time.perf_counter()
+    t_mix = time.perf_counter() - t_mix_start
 
-    # --- Log de desempenho ---
-    synth_duration = t_synth_end - t_synth_start
-    mix_duration = t_mix_end - t_mix_start
-    total_time = time.perf_counter() - t_total_start
-    audio_est = sum(len(d.get('pcm_bytes', b'')) / 2 / 22050 for d in mix_payload if 'pcm_bytes' in d)
+    # --- 7. Tempos finais ---
+    t_total = time.perf_counter() - t_total_start
 
+    # --- Log detalhado da requisição ---
     logger.info(
-        f"Concluída | total={total_time:.3f}s | synth={synth_duration:.3f}s | "
-        f"mix={mix_duration:.3f}s | audio={audio_est:.1f}s"
+        f"⏱️ Tempos | total={t_total:.3f}s | parse={t_parse:.3f}s | split={t_split:.3f}s | "
+        f"prep={t_prep:.3f}s | synth_total={t_synth_total:.3f}s | mix_prep={t_mix_prep:.3f}s | mix={t_mix:.3f}s"
     )
 
+    # --- Acumula estatísticas ---
+    async with stats_lock:
+        stats['total'].append(t_total)
+        stats['parse'].append(t_parse)
+        stats['split'].append(t_split)
+        stats['prep'].append(t_prep)
+        stats['synth_total'].append(t_synth_total)
+        stats['mix_prep'].append(t_mix_prep)
+        stats['mix'].append(t_mix)
+
     return Response(content=wav_bytes, media_type="audio/wav")
+
+# ---------- Endpoint para relatório de estatísticas ----------
+@app.get("/stats")
+async def get_stats():
+    """Retorna um relatório com médias, máximos, mínimos de cada etapa."""
+    async with stats_lock:
+        if not stats['total']:
+            return {"message": "Nenhuma requisição processada ainda."}
+
+        report = {}
+        for key, values in stats.items():
+            report[key] = {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "min": min(values),
+                "max": max(values),
+                "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
+            }
+        return report
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
