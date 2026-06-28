@@ -7,12 +7,11 @@ import logging
 import subprocess
 import tempfile
 import wave
-import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
-import asyncio
 from collections import defaultdict
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------- Instalação automática do Piper ----------
 try:
@@ -30,11 +29,14 @@ from pydantic import BaseModel, Field
 # ---------- Configuração de logs ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
 
-# ---------- Forçar CPU ----------
+# ---------- Forçar CPU e configurar threads ----------
+# Define o número de threads para o ONNX Runtime usar (2 = ambos os núcleos)
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["ORT_NUM_THREADS"] = "2"
 ort.set_default_logger_severity(3)
 
 # ---------- Diretórios ----------
@@ -46,118 +48,6 @@ EFFECTS_DIR = BASE_DIR / "effects"
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
-
-# ---------- Contador global para afinidade de núcleos ----------
-_cpu_counter = mp.Value('i', 0)
-_cpu_lock = mp.Lock()
-
-# ---------- Workers (configuração via env) ----------
-# NÃO forçamos 1 thread – deixamos o ONNX Runtime gerenciar
-TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", 4))
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 20))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
-
-logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
-logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}, timeout: {REQUEST_TIMEOUT}s")
-
-# ---------- Gerenciador de estatísticas por worker (compartilhado) ----------
-manager = mp.Manager()
-worker_stats = manager.dict()
-worker_stats_lock = mp.Lock()
-
-def register_worker(worker_type, worker_id, pid, cpu_id):
-    with worker_stats_lock:
-        key = f"{worker_type}_{worker_id}"
-        worker_stats[key] = {
-            "pid": pid,
-            "cpu_id": cpu_id,
-            "requests_processed": 0,
-            "total_time": 0.0,
-            "avg_time": 0.0,
-        }
-
-def update_worker_stats(worker_type, worker_id, request_time):
-    with worker_stats_lock:
-        key = f"{worker_type}_{worker_id}"
-        if key in worker_stats:
-            data = worker_stats[key]
-            data["requests_processed"] += 1
-            data["total_time"] += request_time
-            data["avg_time"] = data["total_time"] / data["requests_processed"]
-            worker_stats[key] = data
-
-# ---------- Inicializador dos workers TTS ----------
-def _init_tts_worker():
-    # NÃO forçamos 1 thread – removemos OMP_NUM_THREADS e ORT_NUM_THREADS
-    # para que o ONNX Runtime possa usar múltiplas threads.
-    ort.set_default_logger_severity(3)
-
-    with _cpu_lock:
-        cpu_id = _cpu_counter.value
-        _cpu_counter.value += 1
-
-    total_cpus = os.cpu_count()
-    if cpu_id >= total_cpus:
-        cpu_id = cpu_id % total_cpus
-
-    try:
-        os.sched_setaffinity(0, {cpu_id})
-        logger.info(f"TTS Worker fixado ao núcleo {cpu_id}")
-    except Exception as e:
-        logger.warning(f"Falha ao definir afinidade no TTS: {e}")
-
-    worker_id = cpu_id
-    pid = os.getpid()
-    register_worker("tts", worker_id, pid, cpu_id)
-
-    mod = sys.modules['__main__']
-    mod._worker_cpu_id = cpu_id
-    mod._worker_voice_cache = {}
-
-    logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
-
-# ---------- Inicializador dos workers de mixagem ----------
-def _init_mix_worker():
-    # Também não forçamos threads, pois mixagem é feita via FFmpeg em subprocesso.
-    ort.set_default_logger_severity(3)
-
-    with _cpu_lock:
-        cpu_id = _cpu_counter.value
-        _cpu_counter.value += 1
-
-    total_cpus = os.cpu_count()
-    if cpu_id >= total_cpus:
-        cpu_id = cpu_id % total_cpus
-
-    try:
-        os.sched_setaffinity(0, {cpu_id})
-        logger.info(f"Mix Worker fixado ao núcleo {cpu_id}")
-    except Exception as e:
-        logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
-
-    worker_id = cpu_id
-    pid = os.getpid()
-    register_worker("mix", worker_id, pid, cpu_id)
-
-# ---------- VoicePool ----------
-class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
-        import queue
-        self.pool = queue.Queue(maxsize=pool_size)
-        for _ in range(pool_size):
-            voice = PiperVoice.load(
-                model_path,
-                config_path=config_path,
-                use_cuda=False
-            )
-            self.pool.put(voice)
-
-    def get(self, timeout: float = 2.0):
-        return self.pool.get(timeout=timeout)
-
-    def put(self, voice):
-        self.pool.put(voice)
 
 # ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
@@ -206,18 +96,43 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Função para obter o pool de vozes ----------
+# ---------- VoicePool (apenas uma instância, já que temos 1 worker) ----------
+class VoicePool:
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
+        import queue
+        self.pool = queue.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
+            # Cria sessão com 2 threads
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 2
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session = ort.InferenceSession(
+                model_path,
+                sess_options,
+                providers=['CPUExecutionProvider']
+            )
+            voice = PiperVoice.load(
+                model_path,
+                config_path=config_path,
+                session=session,
+                use_cuda=False
+            )
+            self.pool.put(voice)
+
+    def get(self, timeout: float = 2.0):
+        return self.pool.get(timeout=timeout)
+
+    def put(self, voice):
+        self.pool.put(voice)
+
+voice_pools_cache = {}
+
 def get_voice_pool(voice_name):
-    mod = sys.modules['__main__']
-    cache = getattr(mod, '_worker_voice_cache', None)
-    if cache is None:
-        cache = {}
-        mod._worker_voice_cache = cache
-    if voice_name not in cache:
+    if voice_name not in voice_pools_cache:
         model_path, config_path = VOICE_PATHS[voice_name]
-        pool = VoicePool(model_path, config_path, pool_size=1)
-        cache[voice_name] = pool
-    return cache[voice_name]
+        voice_pools_cache[voice_name] = VoicePool(model_path, config_path, pool_size=1)
+    return voice_pools_cache[voice_name]
 
 # ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
@@ -309,8 +224,8 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
-# ---------- Processamento TTS (retorna segmentos) ----------
-def process_tts_only(
+# ---------- Processamento da requisição (sequencial, sem pools) ----------
+def process_request(
     voice_name: Optional[str],
     text: str,
     speed: float,
@@ -318,12 +233,11 @@ def process_tts_only(
     noise_w_scale: float,
     effects: Dict[str, str],
     speakers: List[Dict],
-    enqueue_time: float,
-) -> Tuple[List[Dict], Dict[str, float]]:
-    """Sintetiza os fragmentos, retorna segmentos e métricas de síntese."""
-    t_worker_start = time.perf_counter()
-    queue_wait = t_worker_start - enqueue_time
+    ambient_cfg: Dict,
+) -> Tuple[bytes, Dict[str, float]]:
+    t_start = time.perf_counter()
 
+    # Mapeamento de speakers
     is_dialog = bool(speakers)
     if not is_dialog:
         if not voice_name:
@@ -372,176 +286,87 @@ def process_tts_only(
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
 
-    total_worker_time = time.perf_counter() - t_worker_start
+    # Mixagem
+    wav_bytes, mix_time = mix_and_export_task(segments, ambient_cfg, target_rate=22050)
 
-    # Atualiza estatísticas do worker TTS
-    try:
-        cpu_id = os.sched_getaffinity(0)
-        cpu_id = next(iter(cpu_id))
-        update_worker_stats("tts", cpu_id, total_worker_time)
-    except:
-        pass
+    total_time = time.perf_counter() - t_start
 
     metrics = {
-        'queue_wait': queue_wait,
         'synth_time': synth_time_total,
-        'tts_worker_time': total_worker_time,
+        'mix_time': mix_time,
+        'total_worker_time': total_time,
         'num_segments': len(segments),
     }
 
-    return segments, metrics
-
-# ---------- Pools de processos ----------
-tts_pool = ProcessPoolExecutor(
-    max_workers=TTS_WORKERS,
-    initializer=_init_tts_worker
-)
-mix_pool = ProcessPoolExecutor(
-    max_workers=MIX_WORKERS,
-    initializer=_init_mix_worker
-)
-
-# ---------- Semáforo para controlar concorrência ----------
-request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-# ---------- Modelos Pydantic ----------
-class AmbientConfig(BaseModel):
-    enabled: bool = False
-    file: Optional[str] = None
-    volume_db: float = Field(default=-15.0, ge=-60.0, le=12.0)
-
-class SpeakerMapping(BaseModel):
-    role: str
-    voice: str
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    noise_scale: Optional[float] = Field(default=None, ge=0.0, le=1.5)
-    noise_w_scale: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-
-class TTSRequest(BaseModel):
-    voice: Optional[str] = None
-    text: str = Field(..., min_length=1)
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    noise_scale: float = Field(default=0.667, ge=0.0, le=1.5)
-    noise_w_scale: float = Field(default=0.8, ge=0.0, le=2.0)
-    effects: Dict[str, str] = Field(default_factory=dict)
-    ambient: AmbientConfig = Field(default_factory=AmbientConfig)
-    speakers: List[SpeakerMapping] = Field(default_factory=list)
+    return wav_bytes, metrics
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Otimizada com Diagnóstico)")
+app = FastAPI(title="Piper TTS API (2 vCPUs otimizada)")
 
-# ---------- Estatísticas agregadas ----------
+# ---------- Estatísticas ----------
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
 # ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
-    # Limita o número de requisições simultâneas
-    async with request_semaphore:
-        t_total_start = time.perf_counter()
+    t_total_start = time.perf_counter()
 
-        # Prepara dados
-        speakers_list = []
-        if req.speakers:
-            for spk in req.speakers:
-                speakers_list.append({
-                    'role': spk.role,
-                    'voice': spk.voice,
-                    'speed': spk.speed,
-                    'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
-                    'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
-                })
+    # Prepara dados
+    speakers_list = []
+    if req.speakers:
+        for spk in req.speakers:
+            speakers_list.append({
+                'role': spk.role,
+                'voice': spk.voice,
+                'speed': spk.speed,
+                'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
+                'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
+            })
 
-        try:
-            ambient_dict = req.ambient.model_dump()
-        except AttributeError:
-            ambient_dict = req.ambient.dict()
+    try:
+        ambient_dict = req.ambient.model_dump()
+    except AttributeError:
+        ambient_dict = req.ambient.dict()
 
-        enqueue_time = time.perf_counter()
-        loop = asyncio.get_running_loop()
-
-        # --- Etapa 1: TTS (síntese) ---
-        t_tts_start = time.perf_counter()
-        try:
-            tts_future = loop.run_in_executor(
-                tts_pool,
-                process_tts_only,
-                req.voice,
-                req.text,
-                req.speed,
-                req.noise_scale,
-                req.noise_w_scale,
-                req.effects,
-                speakers_list,
-                enqueue_time
-            )
-            segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
-        except TimeoutError:
-            logger.error("Timeout na síntese TTS")
-            raise HTTPException(504, "TTS synthesis timeout")
-        t_tts = time.perf_counter() - t_tts_start
-
-        # --- Etapa 2: Mixagem ---
-        t_mix_start = time.perf_counter()
-        try:
-            mix_future = loop.run_in_executor(
-                mix_pool,
-                mix_and_export_task,
-                segments,
-                ambient_dict,
-                22050
-            )
-            wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
-        except TimeoutError:
-            logger.error("Timeout na mixagem")
-            raise HTTPException(504, "Mix timeout")
-        t_mix = time.perf_counter() - t_mix_start
-
-        # --- Agrega métricas ---
-        total_time = time.perf_counter() - t_total_start
-        metrics = {
-            'queue_wait': tts_metrics['queue_wait'],
-            'synth_time': tts_metrics['synth_time'],
-            'mix_time': mix_time,
-            'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
-            'num_segments': tts_metrics['num_segments'],
-            'tts_worker_time': tts_metrics['tts_worker_time'],
-        }
-
-        # Atualiza estatísticas do worker de mixagem
-        try:
-            # O worker de mixagem não sabe qual núcleo, mas podemos obter do processo atual
-            cpu_id = os.sched_getaffinity(0)
-            cpu_id = next(iter(cpu_id))
-            update_worker_stats("mix", cpu_id, mix_time)
-        except:
-            pass
-
-        # Atualiza estatísticas agregadas
-        async with stats_lock:
-            stats['total'].append(total_time)
-            stats['queue_wait'].append(metrics['queue_wait'])
-            stats['synth_time'].append(metrics['synth_time'])
-            stats['mix_time'].append(metrics['mix_time'])
-            stats['total_worker_time'].append(metrics['total_worker_time'])
-            stats['num_segments'].append(metrics['num_segments'])
-            stats['tts_worker_time'].append(metrics['tts_worker_time'])
-
-        logger.info(
-            f"⏱️ Requisição: total={total_time:.3f}s | "
-            f"fila={metrics['queue_wait']:.3f}s | synth={metrics['synth_time']:.3f}s | "
-            f"mix={metrics['mix_time']:.3f}s | tts_worker={metrics['tts_worker_time']:.3f}s | "
-            f"segmentos={metrics['num_segments']}"
+    # Executa a síntese e mixagem diretamente (sem pools)
+    try:
+        wav_bytes, metrics = await asyncio.to_thread(
+            process_request,
+            req.voice,
+            req.text,
+            req.speed,
+            req.noise_scale,
+            req.noise_w_scale,
+            req.effects,
+            speakers_list,
+            ambient_dict
         )
+    except Exception as e:
+        logger.error(f"Erro no processamento: {e}")
+        raise HTTPException(500, f"Falha no processamento: {str(e)}")
 
-        return Response(content=wav_bytes, media_type="audio/wav")
+    total_time = time.perf_counter() - t_total_start
 
-# ---------- Endpoints de diagnóstico ----------
+    # Atualiza estatísticas
+    async with stats_lock:
+        stats['total'].append(total_time)
+        stats['synth_time'].append(metrics['synth_time'])
+        stats['mix_time'].append(metrics['mix_time'])
+        stats['total_worker_time'].append(metrics['total_worker_time'])
+        stats['num_segments'].append(metrics['num_segments'])
 
+    logger.info(
+        f"⏱️ Requisição: total={total_time:.3f}s | "
+        f"synth={metrics['synth_time']:.3f}s | mix={metrics['mix_time']:.3f}s | "
+        f"segmentos={metrics['num_segments']}"
+    )
+
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+# ---------- Endpoint de estatísticas ----------
 @app.get("/stats")
 async def get_stats():
-    """Métricas agregadas de todas as requisições."""
     async with stats_lock:
         if not stats['total']:
             return {"message": "Nenhuma requisição processada ainda."}
@@ -564,85 +389,17 @@ async def get_stats():
                 }
         return report
 
-@app.get("/workers")
-async def get_workers():
-    """Estado detalhado de cada worker TTS e Mix."""
-    with worker_stats_lock:
-        workers = []
-        for key, data in worker_stats.items():
-            worker_type, worker_id = key.split('_')
-            workers.append({
-                "type": worker_type,
-                "id": int(worker_id),
-                "pid": data["pid"],
-                "cpu_id": data["cpu_id"],
-                "requests_processed": data["requests_processed"],
-                "avg_time": data["avg_time"],
-            })
-        workers.sort(key=lambda x: (x["type"], x["id"]))
-        return {
-            "total_workers": len(workers),
-            "tts_workers": [w for w in workers if w["type"] == "tts"],
-            "mix_workers": [w for w in workers if w["type"] == "mix"],
-        }
-
-@app.get("/pool_status")
-async def pool_status():
-    """Informações sobre os pools e filas (estimativa)."""
-    with worker_stats_lock:
-        tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
-        mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
-    return {
-        "tts_workers": TTS_WORKERS,
-        "mix_workers": MIX_WORKERS,
-        "tts_registered": tts_count,
-        "mix_registered": mix_count,
-        "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
-        "request_timeout": REQUEST_TIMEOUT,
-        "current_concurrency": request_semaphore._value if hasattr(request_semaphore, '_value') else "unknown",
-    }
-
-@app.post("/reset_stats")
-async def reset_stats():
-    """Reseta todas as estatísticas (requisições e workers)."""
-    async with stats_lock:
-        for key in stats:
-            stats[key].clear()
-    with worker_stats_lock:
-        for key in list(worker_stats.keys()):
-            data = worker_stats[key]
-            data["requests_processed"] = 0
-            data["total_time"] = 0.0
-            data["avg_time"] = 0.0
-            worker_stats[key] = data
-    return {"message": "Estatísticas resetadas com sucesso."}
-
-# ---------- Endpoints de saúde ----------
-@app.get("/started")
-async def started():
-    return Response(status_code=200, content="started")
-
-@app.get("/ready")
-async def ready():
-    if VOICE_PATHS:
-        return Response(status_code=200, content="ready")
-    return Response(status_code=503, content="loading models")
-
-@app.get("/live")
-async def live():
-    return Response(status_code=200, content="alive")
-
+# ---------- Endpoint de saúde ----------
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "voices": list(VOICE_PATHS.keys()),
-        "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
-        "concurrency_limit": MAX_CONCURRENT_REQUESTS,
-        "timeout": REQUEST_TIMEOUT,
+        "threads": os.environ.get("OMP_NUM_THREADS", "2"),
+        "cpus": os.cpu_count(),
     }
 
 # ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
