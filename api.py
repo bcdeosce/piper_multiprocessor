@@ -18,6 +18,21 @@ from collections import defaultdict
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ORT_NUM_THREADS"] = "1"
 
+# ---------- MONKEY PATCH DO ONNX RUNTIME (ANTES DE IMPORTAR O PIPER) ----------
+import onnxruntime as ort
+_original_ort_session = ort.InferenceSession
+
+def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
+    """Cria uma sessão ONNX com intra_op_num_threads=1 forçado."""
+    if sess_options is None:
+        sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 1
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return _original_ort_session(model_path, sess_options, providers=providers, **kwargs)
+
+ort.InferenceSession = _patched_ort_session
+
 # ---------- Instalação automática do psutil (para diagnóstico) ----------
 try:
     import psutil
@@ -32,7 +47,6 @@ except ImportError:
     from piper import PiperVoice, SynthesisConfig
 
 import numpy as np
-import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
@@ -54,40 +68,6 @@ EFFECTS_DIR = BASE_DIR / "effects"
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
-
-# ---------- Função para criar sessão ONNX com 1 thread ----------
-def create_onnx_session(model_path: str, cpu_affinity: set = None):
-    """Cria uma sessão ONNX com intra_op_num_threads=1 e afinidade opcional."""
-    sess_options = ort.SessionOptions()
-    sess_options.intra_op_num_threads = 1
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    if cpu_affinity:
-        try:
-            aff_str = ';'.join(str(c) for c in sorted(cpu_affinity))
-            sess_options.add_session_config_entry(
-                'session.intra_op_thread_affinities', 
-                aff_str
-            )
-            logger.info(f"ONNX session thread affinity: {aff_str}")
-        except Exception as e:
-            logger.warning(f"Não foi possível definir afinidade na sessão ONNX: {e}")
-    
-    session = ort.InferenceSession(
-        model_path,
-        sess_options,
-        providers=['CPUExecutionProvider']
-    )
-    return session
-
-# ---------- Função para carregar voz usando construtor (NÃO o load) ----------
-def load_piper_voice_with_session(model_path: str, config_path: str, cpu_affinity: set = None):
-    """Carrega o PiperVoice usando o construtor, passando a sessão manualmente."""
-    session = create_onnx_session(model_path, cpu_affinity)
-    # Usa o construtor (não o método load) para passar a sessão
-    voice = PiperVoice(model_path, config_path, session=session, use_cuda=False)
-    return voice
 
 # ---------- Detecção de núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
@@ -221,10 +201,8 @@ def _init_tts_worker():
     pid = os.getpid()
     register_worker("tts", worker_id, pid, cpu_id, is_physical=True)
 
-    # Armazena afinidade para usar na criação da sessão ONNX
     mod = sys.modules['__main__']
     mod._worker_cpu_id = cpu_id
-    mod._worker_cpu_affinity = {cpu_id}
     mod._worker_voice_cache = {}
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
@@ -267,14 +245,18 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool com sessão manual ----------
+# ---------- VoicePool (carrega o Piper normalmente) ----------
 class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = 1, cpu_affinity: set = None):
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            # Usa a função que carrega com sessão manual
-            voice = load_piper_voice_with_session(model_path, config_path, cpu_affinity)
+            # O Piper agora cria a sessão via nosso monkey patch, que força intra_op_num_threads=1
+            voice = PiperVoice.load(
+                model_path,
+                config_path=config_path,
+                use_cuda=False
+            )
             self.pool.put(voice)
 
     def get(self, timeout: float = 2.0):
@@ -282,20 +264,6 @@ class VoicePool:
 
     def put(self, voice):
         self.pool.put(voice)
-
-# ---------- Função para obter o pool de vozes ----------
-def get_voice_pool(voice_name):
-    mod = sys.modules['__main__']
-    cache = getattr(mod, '_worker_voice_cache', None)
-    if cache is None:
-        cache = {}
-        mod._worker_voice_cache = cache
-    if voice_name not in cache:
-        model_path, config_path = VOICE_PATHS[voice_name]
-        cpu_affinity = getattr(mod, '_worker_cpu_affinity', None)
-        pool = VoicePool(model_path, config_path, pool_size=1, cpu_affinity=cpu_affinity)
-        cache[voice_name] = pool
-    return cache[voice_name]
 
 # ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
@@ -344,7 +312,18 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Síntese de um fragmento ----------
+def get_voice_pool(voice_name):
+    mod = sys.modules['__main__']
+    cache = getattr(mod, '_worker_voice_cache', None)
+    if cache is None:
+        cache = {}
+        mod._worker_voice_cache = cache
+    if voice_name not in cache:
+        model_path, config_path = VOICE_PATHS[voice_name]
+        pool = VoicePool(model_path, config_path, pool_size=1)
+        cache[voice_name] = pool
+    return cache[voice_name]
+
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -558,7 +537,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Session)")
+app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Monkey Patch)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
