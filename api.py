@@ -24,7 +24,7 @@ except ImportError:
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
 # ---------- Configuração de logs ----------
@@ -46,13 +46,8 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Função para detectar núcleos físicos (não Hyper-Threads) ----------
+# ---------- Função para detectar núcleos físicos ----------
 def get_physical_cores() -> List[int]:
-    """
-    Retorna a lista de IDs das CPUs que são núcleos físicos.
-    No Linux, lê /sys/devices/system/cpu/cpu*/topology/thread_siblings_list.
-    Se falhar, retorna todos os núcleos (fallback).
-    """
     physical = []
     try:
         for cpu in range(os.cpu_count()):
@@ -60,7 +55,6 @@ def get_physical_cores() -> List[int]:
             try:
                 with open(path, 'r') as f:
                     siblings = f.read().strip().split(',')
-                    # Se o primeiro sibling for o próprio CPU, é o núcleo físico
                     if int(siblings[0]) == cpu:
                         physical.append(cpu)
             except FileNotFoundError:
@@ -70,11 +64,9 @@ def get_physical_cores() -> List[int]:
     except Exception as e:
         logger.warning(f"Erro ao detectar núcleos físicos: {e}")
 
-    # Fallback: assume que todos os núcleos são físicos (pior caso)
-    logger.warning("Não foi possível detectar núcleos físicos, usando todos os núcleos")
+    logger.warning("Não foi possível detectar núcleos físicos, usando todos")
     return list(range(os.cpu_count()))
 
-# ---------- Detecção de núcleos físicos ----------
 ALL_CORES = list(range(os.cpu_count()))
 PHYSICAL_CORES = get_physical_cores()
 HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
@@ -83,17 +75,16 @@ logger.info(f"Núcleos totais: {ALL_CORES}")
 logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
 logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 
-# ---------- Contador global para afinidade de núcleos ----------
+# ---------- Contador global ----------
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
-# ---------- Workers (configuração via env) ----------
+# ---------- Workers ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 999999))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
 
-# Ajusta TTS_WORKERS para não exceder o número de núcleos físicos
 if TTS_WORKERS > len(PHYSICAL_CORES):
     logger.warning(
         f"TTS_WORKERS ({TTS_WORKERS}) excede núcleos físicos ({len(PHYSICAL_CORES)}). "
@@ -101,18 +92,9 @@ if TTS_WORKERS > len(PHYSICAL_CORES):
     )
     TTS_WORKERS = len(PHYSICAL_CORES)
 
-# Núcleos físicos disponíveis para mixagem (os que sobrarem após TTS)
-MIX_AVAILABLE_PHYSICAL = len(PHYSICAL_CORES) - TTS_WORKERS
-if MIX_WORKERS > MIX_AVAILABLE_PHYSICAL:
-    logger.warning(
-        f"MIX_WORKERS ({MIX_WORKERS}) excede núcleos físicos disponíveis ({MIX_AVAILABLE_PHYSICAL}). "
-        f"Usando {MIX_AVAILABLE_PHYSICAL} físicos + Hyper-Threads para o restante."
-    )
-    # Mistura: físicos disponíveis + Hyper-Threads se necessário
+logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 
-logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS} (físicos + HT)")
-
-# ---------- Gerenciador de estatísticas por worker ----------
+# ---------- Estatísticas dos workers ----------
 manager = mp.Manager()
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
@@ -139,7 +121,7 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador dos workers TTS (APENAS NÚCLEOS FÍSICOS) ----------
+# ---------- Inicializador TTS ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -148,7 +130,6 @@ def _init_tts_worker():
     with _cpu_lock:
         idx = _cpu_counter.value
         _cpu_counter.value += 1
-        # Distribui entre os núcleos físicos (round-robin)
         cpu_id = PHYSICAL_CORES[idx % len(PHYSICAL_CORES)]
 
     try:
@@ -167,7 +148,7 @@ def _init_tts_worker():
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
 
-# ---------- Inicializador dos workers de mixagem ----------
+# ---------- Inicializador Mix ----------
 def _init_mix_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -175,20 +156,24 @@ def _init_mix_worker():
         idx = _cpu_counter.value
         _cpu_counter.value += 1
 
-        # Primeiro, usa núcleos físicos disponíveis (que sobraram do TTS)
-        # Se acabarem os físicos, usa Hyper-Threads
-        physical_available = [c for c in PHYSICAL_CORES if c not in [w['cpu_id'] for w in worker_stats.values() if w['cpu_id'] in PHYSICAL_CORES]]
+        # Primeiro, tenta usar núcleos físicos disponíveis
+        used_physical = set()
+        for data in worker_stats.values():
+            if data.get("is_physical", False):
+                used_physical.add(data["cpu_id"])
+        physical_available = [c for c in PHYSICAL_CORES if c not in used_physical]
+
         if physical_available:
             cpu_id = physical_available[0]
             is_physical = True
         else:
             # Usa Hyper-Threads
-            ht_available = [c for c in HYPER_THREAD_CORES if c not in [w['cpu_id'] for w in worker_stats.values()]]
+            used_all = set(data["cpu_id"] for data in worker_stats.values())
+            ht_available = [c for c in HYPER_THREAD_CORES if c not in used_all]
             if ht_available:
                 cpu_id = ht_available[0]
                 is_physical = False
             else:
-                # Fallback: round-robin em todos os cores
                 cpu_id = idx % len(ALL_CORES)
                 is_physical = cpu_id in PHYSICAL_CORES
 
@@ -268,7 +253,6 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-# ---------- Função para obter o pool de vozes ----------
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -281,7 +265,6 @@ def get_voice_pool(voice_name):
         cache[voice_name] = pool
     return cache[voice_name]
 
-# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -299,7 +282,6 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem usando FFmpeg ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -360,7 +342,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         t_total = time.perf_counter() - t0
 
-        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
@@ -380,7 +361,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
-# ---------- Processamento TTS (retorna segmentos) ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -460,7 +440,7 @@ def process_tts_only(
 
     return segments, metrics
 
-# ---------- Pools de processos ----------
+# ---------- Pools ----------
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
     initializer=_init_tts_worker
@@ -472,7 +452,7 @@ mix_pool = ProcessPoolExecutor(
 
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
-# ---------- Modelos Pydantic ----------
+# ---------- Modelos ----------
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -496,10 +476,19 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Mixagem Delegada + Detecção de HT)")
+app = FastAPI(title="Piper TTS API (Mixagem Delegada + HT Detection)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
+
+# ---------- Utilitário para JSON indentado ----------
+def json_response(data: Any, status_code: int = 200) -> JSONResponse:
+    """Retorna JSONResponse com indentação de 2 espaços."""
+    return JSONResponse(
+        content=data,
+        status_code=status_code,
+        media_type="application/json"
+    )
 
 # ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
@@ -582,13 +571,12 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
-# ---------- Endpoints de diagnóstico ----------
-
+# ---------- Endpoints de diagnóstico (agora com JSON indentado) ----------
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
         if not stats['total']:
-            return {"message": "Nenhuma requisição processada ainda."}
+            return json_response({"message": "Nenhuma requisição processada ainda."})
         report = {}
         for key, values in stats.items():
             if key == 'num_segments':
@@ -606,7 +594,7 @@ async def get_stats():
                     "max": max(values),
                     "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
                 }
-        return report
+        return json_response(report)
 
 @app.get("/workers")
 async def get_workers():
@@ -619,25 +607,25 @@ async def get_workers():
                 "id": int(worker_id),
                 "pid": data["pid"],
                 "cpu_id": data["cpu_id"],
-                "is_physical": data.get("is_physical", True),  # fallback
+                "is_physical": data.get("is_physical", True),
                 "requests_processed": data["requests_processed"],
                 "avg_time": data["avg_time"],
             })
         workers.sort(key=lambda x: (x["type"], x["id"]))
-        return {
+        return json_response({
             "total_workers": len(workers),
             "physical_cores": PHYSICAL_CORES,
             "hyper_thread_cores": HYPER_THREAD_CORES,
             "tts_workers": [w for w in workers if w["type"] == "tts"],
             "mix_workers": [w for w in workers if w["type"] == "mix"],
-        }
+        })
 
 @app.get("/pool_status")
 async def pool_status():
     with worker_stats_lock:
         tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
         mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
-    return {
+    return json_response({
         "tts_workers": TTS_WORKERS,
         "mix_workers": MIX_WORKERS,
         "tts_registered": tts_count,
@@ -647,7 +635,7 @@ async def pool_status():
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
         "request_timeout": REQUEST_TIMEOUT,
         "current_concurrency": request_semaphore._value if request_semaphore and hasattr(request_semaphore, '_value') else "disabled",
-    }
+    })
 
 @app.post("/reset_stats")
 async def reset_stats():
@@ -661,7 +649,7 @@ async def reset_stats():
             data["total_time"] = 0.0
             data["avg_time"] = 0.0
             worker_stats[key] = data
-    return {"message": "Estatísticas resetadas com sucesso."}
+    return json_response({"message": "Estatísticas resetadas com sucesso."})
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
@@ -680,7 +668,7 @@ async def live():
 
 @app.get("/health")
 async def health():
-    return {
+    return json_response({
         "status": "ok",
         "voices": list(VOICE_PATHS.keys()),
         "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
@@ -688,7 +676,7 @@ async def health():
         "hyper_thread_cores": HYPER_THREAD_CORES,
         "concurrency_limit": MAX_CONCURRENT_REQUESTS,
         "timeout": REQUEST_TIMEOUT,
-    }
+    })
 
 # ---------- Ponto de entrada ----------
 if __name__ == "__main__":
