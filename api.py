@@ -14,6 +14,7 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import asyncio
 from collections import defaultdict
 
+# ---------- Instalação automática do Piper ----------
 try:
     from piper import PiperVoice, SynthesisConfig
 except ImportError:
@@ -26,6 +27,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+# ---------- Configuração de logs ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
@@ -34,6 +36,7 @@ logger = logging.getLogger("piper-api")
 
 ort.set_default_logger_severity(3)
 
+# ---------- Diretórios ----------
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
@@ -43,27 +46,84 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
+# ---------- Função para detectar núcleos físicos (não Hyper-Threads) ----------
+def get_physical_cores() -> List[int]:
+    """
+    Retorna a lista de IDs das CPUs que são núcleos físicos.
+    No Linux, lê /sys/devices/system/cpu/cpu*/topology/thread_siblings_list.
+    Se falhar, retorna todos os núcleos (fallback).
+    """
+    physical = []
+    try:
+        for cpu in range(os.cpu_count()):
+            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            try:
+                with open(path, 'r') as f:
+                    siblings = f.read().strip().split(',')
+                    # Se o primeiro sibling for o próprio CPU, é o núcleo físico
+                    if int(siblings[0]) == cpu:
+                        physical.append(cpu)
+            except FileNotFoundError:
+                continue
+        if physical:
+            return physical
+    except Exception as e:
+        logger.warning(f"Erro ao detectar núcleos físicos: {e}")
+
+    # Fallback: assume que todos os núcleos são físicos (pior caso)
+    logger.warning("Não foi possível detectar núcleos físicos, usando todos os núcleos")
+    return list(range(os.cpu_count()))
+
+# ---------- Detecção de núcleos físicos ----------
+ALL_CORES = list(range(os.cpu_count()))
+PHYSICAL_CORES = get_physical_cores()
+HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
+
+logger.info(f"Núcleos totais: {ALL_CORES}")
+logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
+logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
+
+# ---------- Contador global para afinidade de núcleos ----------
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
+# ---------- Workers (configuração via env) ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 999999))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
 
-logger.info(f"Workers: TTS={TTS_WORKERS}, Mix={MIX_WORKERS}")
-logger.info(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}, timeout: {REQUEST_TIMEOUT}s")
+# Ajusta TTS_WORKERS para não exceder o número de núcleos físicos
+if TTS_WORKERS > len(PHYSICAL_CORES):
+    logger.warning(
+        f"TTS_WORKERS ({TTS_WORKERS}) excede núcleos físicos ({len(PHYSICAL_CORES)}). "
+        f"Limitando para {len(PHYSICAL_CORES)}."
+    )
+    TTS_WORKERS = len(PHYSICAL_CORES)
 
+# Núcleos físicos disponíveis para mixagem (os que sobrarem após TTS)
+MIX_AVAILABLE_PHYSICAL = len(PHYSICAL_CORES) - TTS_WORKERS
+if MIX_WORKERS > MIX_AVAILABLE_PHYSICAL:
+    logger.warning(
+        f"MIX_WORKERS ({MIX_WORKERS}) excede núcleos físicos disponíveis ({MIX_AVAILABLE_PHYSICAL}). "
+        f"Usando {MIX_AVAILABLE_PHYSICAL} físicos + Hyper-Threads para o restante."
+    )
+    # Mistura: físicos disponíveis + Hyper-Threads se necessário
+
+logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS} (físicos + HT)")
+
+# ---------- Gerenciador de estatísticas por worker ----------
 manager = mp.Manager()
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
 
-def register_worker(worker_type, worker_id, pid, cpu_id):
+def register_worker(worker_type, worker_id, pid, cpu_id, is_physical):
     with worker_stats_lock:
         key = f"{worker_type}_{worker_id}"
         worker_stats[key] = {
             "pid": pid,
             "cpu_id": cpu_id,
+            "is_physical": is_physical,
             "requests_processed": 0,
             "total_time": 0.0,
             "avg_time": 0.0,
@@ -79,16 +139,17 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
+# ---------- Inicializador dos workers TTS (APENAS NÚCLEOS FÍSICOS) ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
 
     with _cpu_lock:
-        cpu_id = _cpu_counter.value * 2
-        if cpu_id >= os.cpu_count():
-            cpu_id = (cpu_id % (os.cpu_count() // 2)) * 2
+        idx = _cpu_counter.value
         _cpu_counter.value += 1
+        # Distribui entre os núcleos físicos (round-robin)
+        cpu_id = PHYSICAL_CORES[idx % len(PHYSICAL_CORES)]
 
     try:
         os.sched_setaffinity(0, {cpu_id})
@@ -98,7 +159,7 @@ def _init_tts_worker():
 
     worker_id = cpu_id
     pid = os.getpid()
-    register_worker("tts", worker_id, pid, cpu_id)
+    register_worker("tts", worker_id, pid, cpu_id, is_physical=True)
 
     mod = sys.modules['__main__']
     mod._worker_cpu_id = cpu_id
@@ -106,25 +167,42 @@ def _init_tts_worker():
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
 
+# ---------- Inicializador dos workers de mixagem ----------
 def _init_mix_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
 
     with _cpu_lock:
-        cpu_id = _cpu_counter.value * 2 + 1
-        if cpu_id >= os.cpu_count():
-            cpu_id = (cpu_id % (os.cpu_count() // 2)) * 2 + 1
+        idx = _cpu_counter.value
         _cpu_counter.value += 1
+
+        # Primeiro, usa núcleos físicos disponíveis (que sobraram do TTS)
+        # Se acabarem os físicos, usa Hyper-Threads
+        physical_available = [c for c in PHYSICAL_CORES if c not in [w['cpu_id'] for w in worker_stats.values() if w['cpu_id'] in PHYSICAL_CORES]]
+        if physical_available:
+            cpu_id = physical_available[0]
+            is_physical = True
+        else:
+            # Usa Hyper-Threads
+            ht_available = [c for c in HYPER_THREAD_CORES if c not in [w['cpu_id'] for w in worker_stats.values()]]
+            if ht_available:
+                cpu_id = ht_available[0]
+                is_physical = False
+            else:
+                # Fallback: round-robin em todos os cores
+                cpu_id = idx % len(ALL_CORES)
+                is_physical = cpu_id in PHYSICAL_CORES
 
     try:
         os.sched_setaffinity(0, {cpu_id})
-        logger.info(f"Mix Worker fixado ao núcleo {cpu_id}")
+        logger.info(f"Mix Worker fixado ao núcleo {cpu_id} ({'físico' if is_physical else 'Hyper-Thread'})")
     except Exception as e:
         logger.warning(f"Falha ao definir afinidade na mixagem: {e}")
 
     worker_id = cpu_id
     pid = os.getpid()
-    register_worker("mix", worker_id, pid, cpu_id)
+    register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
@@ -143,6 +221,7 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
+# ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 voices_metadata: Dict[str, dict] = {}
 
@@ -189,6 +268,7 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
+# ---------- Função para obter o pool de vozes ----------
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -201,6 +281,7 @@ def get_voice_pool(voice_name):
         cache[voice_name] = pool
     return cache[voice_name]
 
+# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -218,6 +299,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
+# ---------- Mixagem usando FFmpeg ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -278,7 +360,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         t_total = time.perf_counter() - t0
 
-        # Atualiza estatísticas do worker de mixagem que executou esta tarefa
+        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
@@ -298,6 +380,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
+# ---------- Processamento TTS (retorna segmentos) ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -377,6 +460,7 @@ def process_tts_only(
 
     return segments, metrics
 
+# ---------- Pools de processos ----------
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
     initializer=_init_tts_worker
@@ -388,6 +472,7 @@ mix_pool = ProcessPoolExecutor(
 
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
+# ---------- Modelos Pydantic ----------
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -410,11 +495,13 @@ class TTSRequest(BaseModel):
     ambient: AmbientConfig = Field(default_factory=AmbientConfig)
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
-app = FastAPI(title="Piper TTS API (Mixagem Delegada)")
+# ---------- FastAPI ----------
+app = FastAPI(title="Piper TTS API (Mixagem Delegada + Detecção de HT)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
+# ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     if request_semaphore:
@@ -495,6 +582,8 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
+# ---------- Endpoints de diagnóstico ----------
+
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
@@ -530,12 +619,15 @@ async def get_workers():
                 "id": int(worker_id),
                 "pid": data["pid"],
                 "cpu_id": data["cpu_id"],
+                "is_physical": data.get("is_physical", True),  # fallback
                 "requests_processed": data["requests_processed"],
                 "avg_time": data["avg_time"],
             })
         workers.sort(key=lambda x: (x["type"], x["id"]))
         return {
             "total_workers": len(workers),
+            "physical_cores": PHYSICAL_CORES,
+            "hyper_thread_cores": HYPER_THREAD_CORES,
             "tts_workers": [w for w in workers if w["type"] == "tts"],
             "mix_workers": [w for w in workers if w["type"] == "mix"],
         }
@@ -550,6 +642,8 @@ async def pool_status():
         "mix_workers": MIX_WORKERS,
         "tts_registered": tts_count,
         "mix_registered": mix_count,
+        "physical_cores": PHYSICAL_CORES,
+        "hyper_thread_cores": HYPER_THREAD_CORES,
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
         "request_timeout": REQUEST_TIMEOUT,
         "current_concurrency": request_semaphore._value if request_semaphore and hasattr(request_semaphore, '_value') else "disabled",
@@ -569,6 +663,7 @@ async def reset_stats():
             worker_stats[key] = data
     return {"message": "Estatísticas resetadas com sucesso."}
 
+# ---------- Endpoints de saúde ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
@@ -589,10 +684,13 @@ async def health():
         "status": "ok",
         "voices": list(VOICE_PATHS.keys()),
         "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
+        "physical_cores": PHYSICAL_CORES,
+        "hyper_thread_cores": HYPER_THREAD_CORES,
         "concurrency_limit": MAX_CONCURRENT_REQUESTS,
         "timeout": REQUEST_TIMEOUT,
     }
 
+# ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
