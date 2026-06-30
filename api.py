@@ -161,7 +161,51 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador TTS ----------
+# ---------- MONKEY PATCH: Criar sessão ONNX manualmente ----------
+def create_onnx_session(model_path: str, cpu_affinity: set = None):
+    """Cria uma sessão ONNX com 1 thread e afinidade opcional."""
+    sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 1
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    # Se a afinidade for fornecida, aplica às threads internas
+    if cpu_affinity:
+        try:
+            aff_str = ';'.join(str(c) for c in sorted(cpu_affinity))
+            sess_options.add_session_config_entry(
+                'session.intra_op_thread_affinities', 
+                aff_str
+            )
+            logger.info(f"ONNX session thread affinity: {aff_str}")
+        except Exception as e:
+            logger.warning(f"Não foi possível definir afinidade na sessão ONNX: {e}")
+    
+    session = ort.InferenceSession(
+        model_path,
+        sess_options,
+        providers=['CPUExecutionProvider']
+    )
+    return session
+
+def load_piper_voice_with_session(model_path: str, config_path: str, cpu_affinity: set = None):
+    """
+    Carrega o PiperVoice com uma sessão ONNX configurada manualmente.
+    """
+    session = create_onnx_session(model_path, cpu_affinity)
+    # O construtor do PiperVoice aceita session como argumento (versão 1.2+)
+    # Se não aceitar, usamos o método load com kwargs.
+    try:
+        # Tenta passar a sessão como argumento nomeado
+        voice = PiperVoice.load(model_path, config_path=config_path, session=session, use_cuda=False)
+        logger.info(f"PiperVoice carregado com sessão ONNX personalizada")
+    except TypeError:
+        # Fallback: se a versão não aceitar session, usa o construtor
+        voice = PiperVoice(model_path, config_path, session=session, use_cuda=False)
+        logger.info(f"PiperVoice carregado via construtor com sessão ONNX personalizada")
+    return voice
+
+# ---------- Inicializador dos workers TTS ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -182,8 +226,10 @@ def _init_tts_worker():
     pid = os.getpid()
     register_worker("tts", worker_id, pid, cpu_id, is_physical=True)
 
+    # Armazena a afinidade para usar na criação da sessão ONNX
     mod = sys.modules['__main__']
     mod._worker_cpu_id = cpu_id
+    mod._worker_cpu_affinity = {cpu_id}
     mod._worker_voice_cache = {}
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
@@ -225,17 +271,14 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool ----------
+# ---------- VoicePool com sessão ONNX personalizada ----------
 class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 1, cpu_affinity: set = None):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            voice = PiperVoice.load(
-                model_path,
-                config_path=config_path,
-                use_cuda=False
-            )
+            # Usa a função que carrega com sessão personalizada
+            voice = load_piper_voice_with_session(model_path, config_path, cpu_affinity)
             self.pool.put(voice)
 
     def get(self, timeout: float = 2.0):
@@ -243,6 +286,21 @@ class VoicePool:
 
     def put(self, voice):
         self.pool.put(voice)
+
+# ---------- Função para obter o pool de vozes ----------
+def get_voice_pool(voice_name):
+    mod = sys.modules['__main__']
+    cache = getattr(mod, '_worker_voice_cache', None)
+    if cache is None:
+        cache = {}
+        mod._worker_voice_cache = cache
+    if voice_name not in cache:
+        model_path, config_path = VOICE_PATHS[voice_name]
+        # Pega a afinidade do worker atual (se disponível)
+        cpu_affinity = getattr(mod, '_worker_cpu_affinity', None)
+        pool = VoicePool(model_path, config_path, pool_size=1, cpu_affinity=cpu_affinity)
+        cache[voice_name] = pool
+    return cache[voice_name]
 
 # ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
@@ -291,18 +349,7 @@ def load_all_voices():
 load_all_voices()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
-def get_voice_pool(voice_name):
-    mod = sys.modules['__main__']
-    cache = getattr(mod, '_worker_voice_cache', None)
-    if cache is None:
-        cache = {}
-        mod._worker_voice_cache = cache
-    if voice_name not in cache:
-        model_path, config_path = VOICE_PATHS[voice_name]
-        pool = VoicePool(model_path, config_path, pool_size=1)
-        cache[voice_name] = pool
-    return cache[voice_name]
-
+# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     pool = get_voice_pool(voice_name)
     voice = pool.get()
@@ -320,6 +367,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
+# ---------- Mixagem usando FFmpeg ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     temp_files = []
@@ -399,6 +447,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
+# ---------- Processamento TTS ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -514,7 +563,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Mixagem Delegada + HT Detection)")
+app = FastAPI(title="Piper TTS API (ONNX 1 Thread)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
@@ -687,12 +736,10 @@ async def reset_stats():
             worker_stats[key] = data
     return json_response({"message": "Estatísticas resetadas com sucesso."})
 
-# ---------- DIAGNÓSTICO COMPLETO DE CORES E AFINIDADE ----------
+# ---------- DIAGNÓSTICO COMPLETO ----------
 @app.get("/diagnose_cores")
 async def diagnose_cores():
-    """Retorna informações detalhadas sobre a estrutura de cores e afinidade dos workers."""
     try:
-        # 1. Estrutura de cores via /proc/cpuinfo
         cpuinfo = []
         with open('/proc/cpuinfo', 'r') as f:
             lines = f.readlines()
@@ -715,7 +762,6 @@ async def diagnose_cores():
                 core = int(cpu['core id'])
                 cores_map.setdefault(core, []).append(proc)
 
-        # 2. Siblings por CPU
         siblings = {}
         for cpu in ALL_CORES:
             path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -725,7 +771,6 @@ async def diagnose_cores():
             except:
                 siblings[cpu] = str(cpu)
 
-        # 3. Workers atuais com afinidade real
         workers_info = []
         for key, data in worker_stats.items():
             worker_type, worker_id = key.split('_')
@@ -733,12 +778,10 @@ async def diagnose_cores():
             cpu_id = data["cpu_id"]
             is_physical = data.get("is_physical", False)
 
-            # Obtém afinidade real via psutil
             try:
                 proc = psutil.Process(pid)
                 affinity = proc.cpu_affinity()
                 num_threads = len(proc.threads())
-                # Verifica se há mais de uma thread (paralelismo dentro do worker)
                 has_multiple_threads = num_threads > 1
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 affinity = "N/A"
@@ -758,7 +801,6 @@ async def diagnose_cores():
                 "avg_time": data["avg_time"],
             })
 
-        # 4. Detecta cores via proc e sys
         physical_from_proc = sorted([min(cpus) for cpus in cores_map.values()]) if cores_map else []
         physical_from_sys = []
         for cpu in ALL_CORES:
