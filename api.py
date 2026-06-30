@@ -45,7 +45,6 @@ EFFECTS_DIR.mkdir(exist_ok=True)
 
 # ---------- Função robusta para detectar núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
-    """Lê /proc/cpuinfo e retorna o primeiro CPU de cada core_id."""
     cores = {}
     try:
         with open('/proc/cpuinfo', 'r') as f:
@@ -59,7 +58,6 @@ def get_physical_cores_from_proc() -> List[int]:
                     if core is not None and cpu is not None:
                         cores.setdefault(core, []).append(cpu)
         if cores:
-            # Para cada core, o menor CPU ID é considerado o físico
             physical = sorted([min(cpus) for cpus in cores.values()])
             return physical
     except Exception as e:
@@ -67,7 +65,6 @@ def get_physical_cores_from_proc() -> List[int]:
     return []
 
 def get_physical_cores_from_sys() -> List[int]:
-    """Fallback: lê thread_siblings_list."""
     physical = []
     try:
         for cpu in range(os.cpu_count()):
@@ -75,15 +72,8 @@ def get_physical_cores_from_sys() -> List[int]:
             try:
                 with open(path, 'r') as f:
                     siblings = f.read().strip().split(',')
-                    if len(siblings) > 1:
-                        # Se tiver mais de um, o primeiro é o físico (geralmente)
-                        # Mas vamos verificar se o primeiro é o próprio CPU
-                        if int(siblings[0]) == cpu:
-                            physical.append(cpu)
-                    else:
-                        # Apenas um thread, é físico
-                        if int(siblings[0]) == cpu:
-                            physical.append(cpu)
+                    if int(siblings[0]) == cpu:
+                        physical.append(cpu)
             except FileNotFoundError:
                 continue
         return sorted(set(physical))
@@ -92,8 +82,6 @@ def get_physical_cores_from_sys() -> List[int]:
     return []
 
 def get_physical_cores() -> List[int]:
-    """Tenta detectar núcleos físicos usando múltiplos métodos."""
-    # 1. Verifica variável de ambiente
     env_cores = os.getenv("PHYSICAL_CORES")
     if env_cores:
         try:
@@ -103,23 +91,19 @@ def get_physical_cores() -> List[int]:
         except:
             pass
 
-    # 2. Tenta via /proc/cpuinfo
     cores = get_physical_cores_from_proc()
     if cores:
         logger.info(f"Detectados via /proc/cpuinfo: {cores}")
         return cores
 
-    # 3. Fallback via sys
     cores = get_physical_cores_from_sys()
     if cores:
         logger.info(f"Detectados via sys: {cores}")
         return cores
 
-    # 4. Último recurso: assume todos os núcleos como físicos
     logger.warning("Não foi possível detectar núcleos físicos, usando todos")
     return list(range(os.cpu_count()))
 
-# ---------- Detecta cores ----------
 ALL_CORES = list(range(os.cpu_count()))
 PHYSICAL_CORES = get_physical_cores()
 HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
@@ -128,15 +112,17 @@ logger.info(f"Núcleos totais: {ALL_CORES}")
 logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
 logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 
-# ---------- Contador e locks ----------
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
-# ---------- Workers ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 50))  # Ajustado!
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 50))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
+
+# BATCH CONFIG
+BATCH_SIZE = TTS_WORKERS  # tamanho do lote = número de workers TTS
+BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", 0.1))  # 0.1 segundos
 
 if TTS_WORKERS > len(PHYSICAL_CORES):
     logger.warning(
@@ -144,10 +130,11 @@ if TTS_WORKERS > len(PHYSICAL_CORES):
         f"Limitando para {len(PHYSICAL_CORES)}."
     )
     TTS_WORKERS = len(PHYSICAL_CORES)
+    BATCH_SIZE = TTS_WORKERS
 
 logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
+logger.info(f"BATCH: size={BATCH_SIZE}, timeout={BATCH_TIMEOUT}s")
 
-# ---------- Estatísticas dos workers ----------
 manager = mp.Manager()
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
@@ -174,7 +161,6 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador TTS ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -201,7 +187,6 @@ def _init_tts_worker():
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
 
-# ---------- Inicializador Mix ----------
 def _init_mix_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -238,7 +223,6 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
@@ -257,7 +241,6 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
-# ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 voices_metadata: Dict[str, dict] = {}
 
@@ -388,7 +371,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             "pipe:1"
         ])
 
-        # Adiciona timeout no subprocesso
         result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=10)
         wav_bytes = result.stdout
 
@@ -492,6 +474,103 @@ def process_tts_only(
 
     return segments, metrics
 
+# ---------- Função que processa UMA requisição completa (síntese + mixagem) ----------
+async def process_single_request(req: TTSRequest, enqueue_time: float) -> Tuple[bytes, Dict[str, float]]:
+    """Processa uma requisição individual – usada dentro do lote."""
+    try:
+        ambient_dict = req.ambient.model_dump() if hasattr(req.ambient, 'model_dump') else req.ambient.dict()
+        speakers_list = []
+        if req.speakers:
+            for spk in req.speakers:
+                speakers_list.append({
+                    'role': spk.role,
+                    'voice': spk.voice,
+                    'speed': spk.speed,
+                    'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
+                    'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
+                })
+
+        loop = asyncio.get_running_loop()
+        tts_future = loop.run_in_executor(
+            tts_pool,
+            process_tts_only,
+            req.voice,
+            req.text,
+            req.speed,
+            req.noise_scale,
+            req.noise_w_scale,
+            req.effects,
+            speakers_list,
+            enqueue_time
+        )
+        segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
+
+        mix_future = loop.run_in_executor(
+            mix_pool,
+            mix_and_export_task,
+            segments,
+            ambient_dict,
+            22050
+        )
+        wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
+
+        metrics = {
+            'queue_wait': tts_metrics['queue_wait'],
+            'synth_time': tts_metrics['synth_time'],
+            'mix_time': mix_time,
+            'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
+            'num_segments': tts_metrics['num_segments'],
+            'tts_worker_time': tts_metrics['tts_worker_time'],
+        }
+        return wav_bytes, metrics
+    except Exception as e:
+        logger.error(f"Erro no processamento da requisição: {e}")
+        raise
+
+# ---------- Batching ----------
+request_queue = asyncio.Queue()
+batch_semaphore = asyncio.Semaphore(1)  # Para processar um lote por vez
+
+async def batch_processor():
+    """Worker em background que coleta requisições e processa em lotes."""
+    while True:
+        batch = []
+        # Aguarda até BATCH_TIMEOUT para acumular requisições
+        await asyncio.sleep(BATCH_TIMEOUT)
+
+        # Recolhe até BATCH_SIZE requisições
+        while not request_queue.empty() and len(batch) < BATCH_SIZE:
+            try:
+                item = request_queue.get_nowait()
+                batch.append(item)
+            except asyncio.QueueEmpty:
+                break
+
+        if not batch:
+            continue
+
+        logger.info(f"📦 Processando lote com {len(batch)} requisições")
+
+        # Processa todas as requisições do lote em paralelo
+        start_time = time.perf_counter()
+        tasks = []
+        for req, future, enqueue_time in batch:
+            tasks.append(process_single_request(req, enqueue_time))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Atualiza estatísticas e resolve futures
+        for (req, future, enqueue_time), result in zip(batch, results):
+            if isinstance(result, Exception):
+                logger.error(f"Erro no lote: {result}")
+                future.set_exception(result)
+            else:
+                wav_bytes, metrics = result
+                future.set_result((wav_bytes, metrics))
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(f"✅ Lote concluído em {elapsed:.3f}s ({len(batch)} requisições)")
+
 # ---------- Pools ----------
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
@@ -528,12 +607,11 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Mixagem Delegada + HT Detection)")
+app = FastAPI(title="Piper TTS API (Batching + HT Detection)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
-# ---------- Utilitário JSON indentado ----------
 def json_response(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(
         content=data,
@@ -541,66 +619,23 @@ def json_response(data: Any, status_code: int = 200) -> JSONResponse:
         media_type="application/json"
     )
 
-# ---------- Endpoint principal ----------
+# ---------- Endpoint principal com batching ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     if request_semaphore:
         await request_semaphore.acquire()
     try:
-        t_total_start = time.perf_counter()
-
-        speakers_list = []
-        if req.speakers:
-            for spk in req.speakers:
-                speakers_list.append({
-                    'role': spk.role,
-                    'voice': spk.voice,
-                    'speed': spk.speed,
-                    'noise_scale': spk.noise_scale if spk.noise_scale is not None else req.noise_scale,
-                    'noise_w_scale': spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale,
-                })
-
-        try:
-            ambient_dict = req.ambient.model_dump()
-        except AttributeError:
-            ambient_dict = req.ambient.dict()
-
         enqueue_time = time.perf_counter()
-        loop = asyncio.get_running_loop()
 
-        tts_future = loop.run_in_executor(
-            tts_pool,
-            process_tts_only,
-            req.voice,
-            req.text,
-            req.speed,
-            req.noise_scale,
-            req.noise_w_scale,
-            req.effects,
-            speakers_list,
-            enqueue_time
-        )
-        segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
+        # Cria um future para a resposta
+        future = asyncio.Future()
+        await request_queue.put((req, future, enqueue_time))
 
-        mix_future = loop.run_in_executor(
-            mix_pool,
-            mix_and_export_task,
-            segments,
-            ambient_dict,
-            22050
-        )
-        wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
+        # Aguarda o resultado
+        wav_bytes, metrics = await future
 
-        total_time = time.perf_counter() - t_total_start
-        metrics = {
-            'queue_wait': tts_metrics['queue_wait'],
-            'synth_time': tts_metrics['synth_time'],
-            'mix_time': mix_time,
-            'total_worker_time': tts_metrics['tts_worker_time'] + mix_time,
-            'num_segments': tts_metrics['num_segments'],
-            'tts_worker_time': tts_metrics['tts_worker_time'],
-        }
-
+        # Atualiza estatísticas agregadas
+        total_time = time.perf_counter() - enqueue_time
         async with stats_lock:
             stats['total'].append(total_time)
             stats['queue_wait'].append(metrics['queue_wait'])
@@ -685,6 +720,8 @@ async def pool_status():
         "hyper_thread_cores": HYPER_THREAD_CORES,
         "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
         "request_timeout": REQUEST_TIMEOUT,
+        "batch_size": BATCH_SIZE,
+        "batch_timeout": BATCH_TIMEOUT,
         "current_concurrency": request_semaphore._value if request_semaphore and hasattr(request_semaphore, '_value') else "disabled",
     })
 
@@ -702,12 +739,9 @@ async def reset_stats():
             worker_stats[key] = data
     return json_response({"message": "Estatísticas resetadas com sucesso."})
 
-# ---------- NOVO: Diagnóstico de cores ----------
 @app.get("/diagnose_cores")
 async def diagnose_cores():
-    """Retorna informações detalhadas sobre a estrutura de cores."""
     try:
-        # Coleta informações do /proc/cpuinfo
         cpuinfo = []
         with open('/proc/cpuinfo', 'r') as f:
             lines = f.readlines()
@@ -730,7 +764,6 @@ async def diagnose_cores():
                 core = int(cpu['core id'])
                 cores_map.setdefault(core, []).append(proc)
 
-        # Estrutura de siblings
         siblings = {}
         for cpu in ALL_CORES:
             path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -740,10 +773,7 @@ async def diagnose_cores():
             except:
                 siblings[cpu] = str(cpu)
 
-        # Detecta cores via /proc
         physical_from_proc = sorted([min(cpus) for cpus in cores_map.values()]) if cores_map else []
-
-        # Detecta via sys (método antigo)
         physical_from_sys = []
         for cpu in ALL_CORES:
             path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -768,17 +798,11 @@ async def diagnose_cores():
         logger.error(f"Erro no diagnose: {e}")
         return json_response({"error": str(e)}, status_code=500)
 
-# ---------- NOVO: Definir cores físicos manualmente ----------
 class SetPhysicalCoresRequest(BaseModel):
     cores: List[int]
 
 @app.post("/set_physical_cores")
 async def set_physical_cores(req: SetPhysicalCoresRequest):
-    """
-    Define manualmente os núcleos físicos. Isso NÃO reinicia a API,
-    mas os novos workers criados a partir de agora usarão essa lista.
-    Para aplicar a todos os workers, é necessário reiniciar a API.
-    """
     global PHYSICAL_CORES, HYPER_THREAD_CORES
     new_cores = sorted(set(req.cores))
     if not new_cores:
@@ -796,7 +820,6 @@ async def set_physical_cores(req: SetPhysicalCoresRequest):
         "note": "Os workers já existentes não serão afetados; novos workers usarão esta configuração."
     })
 
-# ---------- Endpoints de saúde ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
@@ -821,7 +844,15 @@ async def health():
         "hyper_thread_cores": HYPER_THREAD_CORES,
         "concurrency_limit": MAX_CONCURRENT_REQUESTS,
         "timeout": REQUEST_TIMEOUT,
+        "batch_size": BATCH_SIZE,
+        "batch_timeout": BATCH_TIMEOUT,
     })
+
+# ---------- Inicia o processador de batch ----------
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(batch_processor())
+    logger.info(f"🚀 Batch processor iniciado: size={BATCH_SIZE}, timeout={BATCH_TIMEOUT}s")
 
 # ---------- Ponto de entrada ----------
 if __name__ == "__main__":
