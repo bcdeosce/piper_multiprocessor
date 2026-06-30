@@ -343,11 +343,16 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
 
 # ---------- Mixagem ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+    """
+    Concatena os segmentos de áudio na ordem em que aparecem,
+    e depois (opcionalmente) mixa com o áudio ambiente de fundo.
+    """
     t0 = time.perf_counter()
     temp_files = []
     ffmpeg_cmd = ["ffmpeg", "-y"]
 
     try:
+        # 1. Cria arquivos temporários para cada segmento (mantendo a ordem)
         for data in segments_data:
             if 'pcm_bytes' in data:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -373,35 +378,93 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 continue
 
+        if not temp_files:
+            raise ValueError("Nenhum arquivo para processar")
+
+        # 2. Concatenação dos segmentos (ordem original)
+        # Se houver apenas um segmento, não precisa de filtro de concatenação
+        if len(temp_files) == 1:
+            # Apenas copia o arquivo para o próximo passo
+            concat_output = temp_files[0]
+        else:
+            # Concatena todos os arquivos em um único WAV
+            concat_cmd = ["ffmpeg", "-y"]
+            for f in temp_files:
+                concat_cmd.extend(["-i", f])
+            concat_filter = f"concat=n={len(temp_files)}:v=0:a=1"
+            concat_cmd.extend([
+                "-filter_complex", concat_filter,
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ])
+            result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
+            concat_bytes = result.stdout
+
+            # Salva o resultado concatenado em um novo arquivo temporário
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                f.write(concat_bytes)
+                concat_output = f.name
+
+        # 3. Se o ambiente estiver habilitado, mistura (mix) com o áudio ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if ambient_path.exists():
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    with open(ambient_path, 'rb') as src:
-                        f.write(src.read())
-                    temp_files.append(f.name)
+            if not ambient_path.exists():
+                raise FileNotFoundError(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado")
 
-        if not temp_files:
-            raise ValueError("Nenhum arquivo para mixar")
+            # Carrega o ambiente e ajusta para mono e sample rate alvo
+            ambient_adjusted = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            ambient_adjusted_path = ambient_adjusted.name
+            ambient_adjusted.close()
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", str(ambient_path),
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                ambient_adjusted_path
+            ], capture_output=True, check=True)
 
+            # Mixa o áudio concatenado com o ambiente (sobreposição)
+            mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", concat_output,
+                "-i", ambient_adjusted_path,
+                "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.5",
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ]
+            result = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
+            final_wav = result.stdout
+
+            # Remove o arquivo temporário do ambiente
+            os.unlink(ambient_adjusted_path)
+        else:
+            # Sem ambiente: usa o áudio concatenado diretamente
+            with open(concat_output, 'rb') as f:
+                final_wav = f.read()
+
+        # 4. Limpeza dos arquivos temporários
         for f in temp_files:
-            ffmpeg_cmd.extend(["-i", f])
-
-        filter_complex = f"amix=inputs={len(temp_files)}:duration=longest"
-        ffmpeg_cmd.extend([
-            "-filter_complex", filter_complex,
-            "-ar", str(target_rate),
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            "-f", "wav",
-            "pipe:1"
-        ])
-
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=10)
-        wav_bytes = result.stdout
+            try:
+                os.unlink(f)
+            except:
+                pass
+        if len(temp_files) > 1:
+            try:
+                os.unlink(concat_output)
+            except:
+                pass
 
         t_total = time.perf_counter() - t0
+        logger.info(f"Concatenação + mixagem concluída em {t_total:.3f}s | {len(temp_files)} segmentos")
 
+        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
@@ -409,15 +472,21 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         except:
             pass
 
-        return wav_bytes, t_total
+        return final_wav, t_total
 
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg erro: {e.stderr.decode()}")
-        raise RuntimeError("Falha na mixagem com FFmpeg")
+        raise RuntimeError("Falha no processamento com FFmpeg")
     finally:
+        # Garante a remoção de todos os temporários, mesmo em caso de erro
         for f in temp_files:
             try:
                 os.unlink(f)
+            except:
+                pass
+        if len(temp_files) > 1:
+            try:
+                os.unlink(concat_output)
             except:
                 pass
 
