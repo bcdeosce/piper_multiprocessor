@@ -43,7 +43,7 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Função robusta para detectar núcleos físicos ----------
+# ---------- Função para detectar núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
     cores = {}
     try:
@@ -115,14 +115,12 @@ logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
+# ---------- Configuração de workers e batching ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 50))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
-
-# BATCH CONFIG
-BATCH_SIZE = TTS_WORKERS  # tamanho do lote = número de workers TTS
-BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", 0.1))  # 0.1 segundos
+BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", 0.1))
 
 if TTS_WORKERS > len(PHYSICAL_CORES):
     logger.warning(
@@ -130,11 +128,13 @@ if TTS_WORKERS > len(PHYSICAL_CORES):
         f"Limitando para {len(PHYSICAL_CORES)}."
     )
     TTS_WORKERS = len(PHYSICAL_CORES)
-    BATCH_SIZE = TTS_WORKERS
+
+BATCH_SIZE = TTS_WORKERS
 
 logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 logger.info(f"BATCH: size={BATCH_SIZE}, timeout={BATCH_TIMEOUT}s")
 
+# ---------- Estatísticas dos workers ----------
 manager = mp.Manager()
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
@@ -161,6 +161,7 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
+# ---------- Inicializadores dos workers ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -223,6 +224,7 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
@@ -241,6 +243,7 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
+# ---------- Registro de vozes ----------
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 voices_metadata: Dict[str, dict] = {}
 
@@ -474,9 +477,43 @@ def process_tts_only(
 
     return segments, metrics
 
-# ---------- Função que processa UMA requisição completa (síntese + mixagem) ----------
+# ---------- Pools de processos ----------
+tts_pool = ProcessPoolExecutor(
+    max_workers=TTS_WORKERS,
+    initializer=_init_tts_worker
+)
+mix_pool = ProcessPoolExecutor(
+    max_workers=MIX_WORKERS,
+    initializer=_init_mix_worker
+)
+
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
+
+# ---------- Modelos Pydantic (definidos ANTES das funções que os usam) ----------
+class AmbientConfig(BaseModel):
+    enabled: bool = False
+    file: Optional[str] = None
+    volume_db: float = Field(default=-15.0, ge=-60.0, le=12.0)
+
+class SpeakerMapping(BaseModel):
+    role: str
+    voice: str
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    noise_scale: Optional[float] = Field(default=None, ge=0.0, le=1.5)
+    noise_w_scale: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+
+class TTSRequest(BaseModel):
+    voice: Optional[str] = None
+    text: str = Field(..., min_length=1)
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    noise_scale: float = Field(default=0.667, ge=0.0, le=1.5)
+    noise_w_scale: float = Field(default=0.8, ge=0.0, le=2.0)
+    effects: Dict[str, str] = Field(default_factory=dict)
+    ambient: AmbientConfig = Field(default_factory=AmbientConfig)
+    speakers: List[SpeakerMapping] = Field(default_factory=list)
+
+# ---------- Função que processa UMA requisição (usa TTSRequest, agora definido) ----------
 async def process_single_request(req: TTSRequest, enqueue_time: float) -> Tuple[bytes, Dict[str, float]]:
-    """Processa uma requisição individual – usada dentro do lote."""
     try:
         ambient_dict = req.ambient.model_dump() if hasattr(req.ambient, 'model_dump') else req.ambient.dict()
         speakers_list = []
@@ -529,16 +566,11 @@ async def process_single_request(req: TTSRequest, enqueue_time: float) -> Tuple[
 
 # ---------- Batching ----------
 request_queue = asyncio.Queue()
-batch_semaphore = asyncio.Semaphore(1)  # Para processar um lote por vez
 
 async def batch_processor():
-    """Worker em background que coleta requisições e processa em lotes."""
     while True:
-        batch = []
-        # Aguarda até BATCH_TIMEOUT para acumular requisições
         await asyncio.sleep(BATCH_TIMEOUT)
-
-        # Recolhe até BATCH_SIZE requisições
+        batch = []
         while not request_queue.empty() and len(batch) < BATCH_SIZE:
             try:
                 item = request_queue.get_nowait()
@@ -550,16 +582,10 @@ async def batch_processor():
             continue
 
         logger.info(f"📦 Processando lote com {len(batch)} requisições")
-
-        # Processa todas as requisições do lote em paralelo
         start_time = time.perf_counter()
-        tasks = []
-        for req, future, enqueue_time in batch:
-            tasks.append(process_single_request(req, enqueue_time))
-
+        tasks = [process_single_request(req, enqueue_time) for req, future, enqueue_time in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Atualiza estatísticas e resolve futures
         for (req, future, enqueue_time), result in zip(batch, results):
             if isinstance(result, Exception):
                 logger.error(f"Erro no lote: {result}")
@@ -571,70 +597,25 @@ async def batch_processor():
         elapsed = time.perf_counter() - start_time
         logger.info(f"✅ Lote concluído em {elapsed:.3f}s ({len(batch)} requisições)")
 
-# ---------- Pools ----------
-tts_pool = ProcessPoolExecutor(
-    max_workers=TTS_WORKERS,
-    initializer=_init_tts_worker
-)
-mix_pool = ProcessPoolExecutor(
-    max_workers=MIX_WORKERS,
-    initializer=_init_mix_worker
-)
-
-request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
-
-# ---------- Modelos ----------
-class AmbientConfig(BaseModel):
-    enabled: bool = False
-    file: Optional[str] = None
-    volume_db: float = Field(default=-15.0, ge=-60.0, le=12.0)
-
-class SpeakerMapping(BaseModel):
-    role: str
-    voice: str
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    noise_scale: Optional[float] = Field(default=None, ge=0.0, le=1.5)
-    noise_w_scale: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-
-class TTSRequest(BaseModel):
-    voice: Optional[str] = None
-    text: str = Field(..., min_length=1)
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    noise_scale: float = Field(default=0.667, ge=0.0, le=1.5)
-    noise_w_scale: float = Field(default=0.8, ge=0.0, le=2.0)
-    effects: Dict[str, str] = Field(default_factory=dict)
-    ambient: AmbientConfig = Field(default_factory=AmbientConfig)
-    speakers: List[SpeakerMapping] = Field(default_factory=list)
-
 # ---------- FastAPI ----------
 app = FastAPI(title="Piper TTS API (Batching + HT Detection)")
-
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
 def json_response(data: Any, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(
-        content=data,
-        status_code=status_code,
-        media_type="application/json"
-    )
+    return JSONResponse(content=data, status_code=status_code, media_type="application/json")
 
-# ---------- Endpoint principal com batching ----------
+# ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     if request_semaphore:
         await request_semaphore.acquire()
     try:
         enqueue_time = time.perf_counter()
-
-        # Cria um future para a resposta
         future = asyncio.Future()
         await request_queue.put((req, future, enqueue_time))
-
-        # Aguarda o resultado
         wav_bytes, metrics = await future
 
-        # Atualiza estatísticas agregadas
         total_time = time.perf_counter() - enqueue_time
         async with stats_lock:
             stats['total'].append(total_time)
@@ -651,7 +632,6 @@ async def synthesize(req: TTSRequest):
             f"mix={metrics['mix_time']:.3f}s | tts_worker={metrics['tts_worker_time']:.3f}s | "
             f"segmentos={metrics['num_segments']}"
         )
-
         return Response(content=wav_bytes, media_type="audio/wav")
     finally:
         if request_semaphore:
@@ -666,12 +646,7 @@ async def get_stats():
         report = {}
         for key, values in stats.items():
             if key == 'num_segments':
-                report[key] = {
-                    "count": len(values),
-                    "mean": sum(values) / len(values),
-                    "min": min(values),
-                    "max": max(values),
-                }
+                report[key] = {"count": len(values), "mean": sum(values) / len(values), "min": min(values), "max": max(values)}
             else:
                 report[key] = {
                     "count": len(values),
