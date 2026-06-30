@@ -14,7 +14,6 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import asyncio
 from collections import defaultdict
 
-# ---------- Instalação automática do Piper ----------
 try:
     from piper import PiperVoice, SynthesisConfig
 except ImportError:
@@ -27,7 +26,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------- Configuração de logs ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
@@ -36,7 +34,6 @@ logger = logging.getLogger("piper-api")
 
 ort.set_default_logger_severity(3)
 
-# ---------- Diretórios ----------
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
@@ -46,8 +43,31 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Função para detectar núcleos físicos ----------
-def get_physical_cores() -> List[int]:
+# ---------- Função robusta para detectar núcleos físicos ----------
+def get_physical_cores_from_proc() -> List[int]:
+    """Lê /proc/cpuinfo e retorna o primeiro CPU de cada core_id."""
+    cores = {}
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            cpu = None
+            core = None
+            for line in f:
+                if line.startswith('processor'):
+                    cpu = int(line.split(':')[1].strip())
+                elif line.startswith('core id'):
+                    core = int(line.split(':')[1].strip())
+                    if core is not None and cpu is not None:
+                        cores.setdefault(core, []).append(cpu)
+        if cores:
+            # Para cada core, o menor CPU ID é considerado o físico
+            physical = sorted([min(cpus) for cpus in cores.values()])
+            return physical
+    except Exception as e:
+        logger.warning(f"Erro ao ler /proc/cpuinfo: {e}")
+    return []
+
+def get_physical_cores_from_sys() -> List[int]:
+    """Fallback: lê thread_siblings_list."""
     physical = []
     try:
         for cpu in range(os.cpu_count()):
@@ -55,18 +75,51 @@ def get_physical_cores() -> List[int]:
             try:
                 with open(path, 'r') as f:
                     siblings = f.read().strip().split(',')
-                    if int(siblings[0]) == cpu:
-                        physical.append(cpu)
+                    if len(siblings) > 1:
+                        # Se tiver mais de um, o primeiro é o físico (geralmente)
+                        # Mas vamos verificar se o primeiro é o próprio CPU
+                        if int(siblings[0]) == cpu:
+                            physical.append(cpu)
+                    else:
+                        # Apenas um thread, é físico
+                        if int(siblings[0]) == cpu:
+                            physical.append(cpu)
             except FileNotFoundError:
                 continue
-        if physical:
-            return physical
+        return sorted(set(physical))
     except Exception as e:
-        logger.warning(f"Erro ao detectar núcleos físicos: {e}")
+        logger.warning(f"Erro ao ler sys: {e}")
+    return []
 
+def get_physical_cores() -> List[int]:
+    """Tenta detectar núcleos físicos usando múltiplos métodos."""
+    # 1. Verifica variável de ambiente
+    env_cores = os.getenv("PHYSICAL_CORES")
+    if env_cores:
+        try:
+            cores = [int(c.strip()) for c in env_cores.split(',') if c.strip()]
+            logger.info(f"Usando PHYSICAL_CORES do env: {cores}")
+            return cores
+        except:
+            pass
+
+    # 2. Tenta via /proc/cpuinfo
+    cores = get_physical_cores_from_proc()
+    if cores:
+        logger.info(f"Detectados via /proc/cpuinfo: {cores}")
+        return cores
+
+    # 3. Fallback via sys
+    cores = get_physical_cores_from_sys()
+    if cores:
+        logger.info(f"Detectados via sys: {cores}")
+        return cores
+
+    # 4. Último recurso: assume todos os núcleos como físicos
     logger.warning("Não foi possível detectar núcleos físicos, usando todos")
     return list(range(os.cpu_count()))
 
+# ---------- Detecta cores ----------
 ALL_CORES = list(range(os.cpu_count()))
 PHYSICAL_CORES = get_physical_cores()
 HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
@@ -75,14 +128,14 @@ logger.info(f"Núcleos totais: {ALL_CORES}")
 logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
 logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 
-# ---------- Contador global ----------
+# ---------- Contador e locks ----------
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
 # ---------- Workers ----------
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 999999))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 50))  # Ajustado!
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", 30.0))
 
 if TTS_WORKERS > len(PHYSICAL_CORES):
@@ -156,7 +209,6 @@ def _init_mix_worker():
         idx = _cpu_counter.value
         _cpu_counter.value += 1
 
-        # Primeiro, tenta usar núcleos físicos disponíveis
         used_physical = set()
         for data in worker_stats.values():
             if data.get("is_physical", False):
@@ -167,7 +219,6 @@ def _init_mix_worker():
             cpu_id = physical_available[0]
             is_physical = True
         else:
-            # Usa Hyper-Threads
             used_all = set(data["cpu_id"] for data in worker_stats.values())
             ht_available = [c for c in HYPER_THREAD_CORES if c not in used_all]
             if ht_available:
@@ -337,7 +388,8 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             "pipe:1"
         ])
 
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+        # Adiciona timeout no subprocesso
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=10)
         wav_bytes = result.stdout
 
         t_total = time.perf_counter() - t0
@@ -481,9 +533,8 @@ app = FastAPI(title="Piper TTS API (Mixagem Delegada + HT Detection)")
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
 
-# ---------- Utilitário para JSON indentado ----------
+# ---------- Utilitário JSON indentado ----------
 def json_response(data: Any, status_code: int = 200) -> JSONResponse:
-    """Retorna JSONResponse com indentação de 2 espaços."""
     return JSONResponse(
         content=data,
         status_code=status_code,
@@ -571,7 +622,7 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
-# ---------- Endpoints de diagnóstico (agora com JSON indentado) ----------
+# ---------- Endpoints de diagnóstico ----------
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
@@ -650,6 +701,100 @@ async def reset_stats():
             data["avg_time"] = 0.0
             worker_stats[key] = data
     return json_response({"message": "Estatísticas resetadas com sucesso."})
+
+# ---------- NOVO: Diagnóstico de cores ----------
+@app.get("/diagnose_cores")
+async def diagnose_cores():
+    """Retorna informações detalhadas sobre a estrutura de cores."""
+    try:
+        # Coleta informações do /proc/cpuinfo
+        cpuinfo = []
+        with open('/proc/cpuinfo', 'r') as f:
+            lines = f.readlines()
+        current = {}
+        for line in lines:
+            if line.strip() == '':
+                if current:
+                    cpuinfo.append(current)
+                    current = {}
+                continue
+            key, val = line.split(':', 1)
+            current[key.strip()] = val.strip()
+        if current:
+            cpuinfo.append(current)
+
+        cores_map = {}
+        for cpu in cpuinfo:
+            if 'processor' in cpu and 'core id' in cpu:
+                proc = int(cpu['processor'])
+                core = int(cpu['core id'])
+                cores_map.setdefault(core, []).append(proc)
+
+        # Estrutura de siblings
+        siblings = {}
+        for cpu in ALL_CORES:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            try:
+                with open(path, 'r') as f:
+                    siblings[cpu] = f.read().strip()
+            except:
+                siblings[cpu] = str(cpu)
+
+        # Detecta cores via /proc
+        physical_from_proc = sorted([min(cpus) for cpus in cores_map.values()]) if cores_map else []
+
+        # Detecta via sys (método antigo)
+        physical_from_sys = []
+        for cpu in ALL_CORES:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            try:
+                with open(path, 'r') as f:
+                    sibs = f.read().strip().split(',')
+                    if int(sibs[0]) == cpu:
+                        physical_from_sys.append(cpu)
+            except:
+                pass
+
+        return json_response({
+            "total_cores": os.cpu_count(),
+            "cores_map": cores_map,
+            "siblings": siblings,
+            "physical_cores_from_proc": physical_from_proc,
+            "physical_cores_from_sys": sorted(set(physical_from_sys)),
+            "current_physical_cores": PHYSICAL_CORES,
+            "current_hyper_thread_cores": HYPER_THREAD_CORES,
+        })
+    except Exception as e:
+        logger.error(f"Erro no diagnose: {e}")
+        return json_response({"error": str(e)}, status_code=500)
+
+# ---------- NOVO: Definir cores físicos manualmente ----------
+class SetPhysicalCoresRequest(BaseModel):
+    cores: List[int]
+
+@app.post("/set_physical_cores")
+async def set_physical_cores(req: SetPhysicalCoresRequest):
+    """
+    Define manualmente os núcleos físicos. Isso NÃO reinicia a API,
+    mas os novos workers criados a partir de agora usarão essa lista.
+    Para aplicar a todos os workers, é necessário reiniciar a API.
+    """
+    global PHYSICAL_CORES, HYPER_THREAD_CORES
+    new_cores = sorted(set(req.cores))
+    if not new_cores:
+        return json_response({"error": "Lista de cores vazia"}, status_code=400)
+    if max(new_cores) >= os.cpu_count() or min(new_cores) < 0:
+        return json_response({"error": "Core ID fora do intervalo"}, status_code=400)
+
+    PHYSICAL_CORES = new_cores
+    HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
+    logger.info(f"PHYSICAL_CORES alterado manualmente para: {PHYSICAL_CORES}")
+    return json_response({
+        "message": "Núcleos físicos atualizados. Reinicie a API para aplicar a todos os workers.",
+        "physical_cores": PHYSICAL_CORES,
+        "hyper_thread_cores": HYPER_THREAD_CORES,
+        "note": "Os workers já existentes não serão afetados; novos workers usarão esta configuração."
+    })
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
