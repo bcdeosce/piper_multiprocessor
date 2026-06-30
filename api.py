@@ -37,6 +37,48 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
+# ---------- MONKEY PATCH: Forçar ONNX a usar 1 thread ----------
+# Salvamos o método original de criação da sessão
+_original_create_inference_session = PiperVoice._create_inference_session
+
+def _patched_create_inference_session(self, model_path, config):
+    """
+    Substitui a criação da sessão ONNX para forçar intra_op_num_threads=1.
+    """
+    # Cria as opções da sessão com 1 thread
+    sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 1
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    # Tenta definir afinidade para o núcleo atual (se disponível)
+    try:
+        import os
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            aff_str = ';'.join(str(c) for c in sorted(affinity))
+            sess_options.add_session_config_entry(
+                'session.intra_op_thread_affinities', 
+                aff_str
+            )
+    except:
+        pass
+    
+    # Cria a sessão com as opções customizadas
+    session = ort.InferenceSession(
+        model_path,
+        sess_options,
+        providers=['CPUExecutionProvider']
+    )
+    
+    # Armazena a sessão no objeto (o Piper espera que exista)
+    self._session = session
+    return session
+
+# Aplica o patch
+PiperVoice._create_inference_session = _patched_create_inference_session
+logger = logging.getLogger("piper-api")  # Já definido abaixo, mas garantimos
+
 # ---------- Configuração de logs ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -232,15 +274,13 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool (carrega o Piper normalmente, confiando nas variáveis de ambiente) ----------
+# ---------- VoicePool (carrega o Piper normalmente) ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            # Não passa session – o Piper cria a sessão internamente,
-            # mas as variáveis de ambiente OMP_NUM_THREADS=1 e ORT_NUM_THREADS=1
-            # forçam o ONNX a usar apenas 1 thread.
+            # O Piper agora usa o monkey patch para criar a sessão com 1 thread
             voice = PiperVoice.load(
                 model_path,
                 config_path=config_path,
@@ -526,7 +566,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Env)")
+app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Monkey Patch)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
