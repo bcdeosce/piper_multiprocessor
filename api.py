@@ -52,6 +52,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
     from piper import PiperVoice, SynthesisConfig
 
+from pydub import AudioSegment
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
@@ -68,7 +69,7 @@ logger = logging.getLogger("piper-api")
 ort.set_default_logger_severity(3)
 
 # ============================================================================
-# 5. DIRETÓRIOS
+# 5. DIRETÓRIOS E CONSTANTES
 # ============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
@@ -78,6 +79,10 @@ EFFECTS_DIR = BASE_DIR / "effects"
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
+
+TARGET_RATE = 22050
+AUDIO_SAMPLE_WIDTH = 2  # 16-bit
+AUDIO_CHANNELS = 1      # mono
 
 # ============================================================================
 # 6. DETECÇÃO DE NÚCLEOS FÍSICOS
@@ -147,55 +152,57 @@ logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
 logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 
 # ============================================================================
-# 7. PRÉ-CARREGAMENTO DE EFEITOS (CACHE GLOBAL)
+# 7. CACHE DE EFEITOS (PRÉ-CARREGAMENTO)
 # ============================================================================
-EFFECTS_CACHE = {}
-TARGET_RATE = 22050
+EFFECTS_CACHE: Dict[str, AudioSegment] = {}
+
+def load_effect_to_cache(effect_file: str) -> Optional[AudioSegment]:
+    """Carrega um efeito do disco, normaliza e guarda em cache."""
+    if effect_file in EFFECTS_CACHE:
+        return EFFECTS_CACHE[effect_file]
+
+    # Procura no diretório global de efeitos
+    effect_path = EFFECTS_DIR / effect_file
+    if effect_path.exists():
+        try:
+            seg = AudioSegment.from_wav(str(effect_path))
+            seg = seg.set_channels(AUDIO_CHANNELS).set_frame_rate(TARGET_RATE).set_sample_width(AUDIO_SAMPLE_WIDTH)
+            EFFECTS_CACHE[effect_file] = seg
+            logger.info(f"Efeito carregado em cache: {effect_file}")
+            return seg
+        except Exception as e:
+            logger.warning(f"Erro ao carregar efeito {effect_file}: {e}")
+            return None
+
+    # Procura nas pastas das vozes
+    for voice_name in VOICE_PATHS.keys():
+        voice_dir = VOICES_DIR / voice_name
+        effect_path = voice_dir / effect_file
+        if effect_path.exists():
+            try:
+                seg = AudioSegment.from_wav(str(effect_path))
+                seg = seg.set_channels(AUDIO_CHANNELS).set_frame_rate(TARGET_RATE).set_sample_width(AUDIO_SAMPLE_WIDTH)
+                EFFECTS_CACHE[effect_file] = seg
+                logger.info(f"Efeito carregado em cache (voz): {effect_file}")
+                return seg
+            except Exception as e:
+                logger.warning(f"Erro ao carregar efeito {effect_file} da voz {voice_name}: {e}")
+                return None
+
+    logger.warning(f"Efeito {effect_file} não encontrado.")
+    return None
 
 def preload_effects():
-    """Carrega todos os efeitos disponíveis e normaliza para mono, TARGET_RATE, PCM 16-bit."""
+    """Pré-carrega todos os efeitos disponíveis no diretório global e das vozes."""
     logger.info("Pré-carregando efeitos...")
+    # Efeitos globais
     for effect_file in EFFECTS_DIR.glob("*.wav"):
-        effect_name = effect_file.name
-        try:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(effect_file),
-                "-ar", str(TARGET_RATE),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                "-f", "wav",
-                "pipe:1"
-            ]
-            result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
-            EFFECTS_CACHE[effect_name] = result.stdout
-            logger.info(f"Efeito pré-carregado: {effect_name}")
-        except Exception as e:
-            logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
-
-    # Também procura efeitos nas pastas das vozes
+        load_effect_to_cache(effect_file.name)
+    # Efeitos nas pastas das vozes
     for voice_name in VOICE_PATHS.keys():
         voice_dir = VOICES_DIR / voice_name
         for effect_file in voice_dir.glob("*.wav"):
-            effect_name = effect_file.name
-            if effect_name in EFFECTS_CACHE:
-                continue
-            try:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(effect_file),
-                    "-ar", str(TARGET_RATE),
-                    "-ac", "1",
-                    "-c:a", "pcm_s16le",
-                    "-f", "wav",
-                    "pipe:1"
-                ]
-                result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
-                EFFECTS_CACHE[effect_name] = result.stdout
-                logger.info(f"Efeito pré-carregado (voz): {effect_name}")
-            except Exception as e:
-                logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
-
+            load_effect_to_cache(effect_file.name)
     logger.info(f"Total de efeitos pré-carregados: {len(EFFECTS_CACHE)}")
 
 # ============================================================================
@@ -379,7 +386,7 @@ logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 preload_effects()
 
 # ============================================================================
-# 14. FUNÇÕES DE SÍNTESE E MIXAGEM
+# 14. FUNÇÃO DE SÍNTESE (EXECUTADA NO WORKER TTS)
 # ============================================================================
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
@@ -410,154 +417,97 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
+# ============================================================================
+# 15. FUNÇÃO DE MIXAGEM E CONCATENAÇÃO (EXECUTADA NO WORKER MIX)
+# ============================================================================
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_RATE):
+    """
+    Concatena segmentos (fala + efeitos) na ordem correta usando pydub.
+    Aplica ambiente se configurado.
+    """
     t0 = time.perf_counter()
-    temp_files = []
+    combined = AudioSegment.empty()
+
+    for idx, data in enumerate(segments_data):
+        if 'pcm_bytes' in data:
+            # Segmento de fala (PCM)
+            seg = AudioSegment(
+                data=data['pcm_bytes'],
+                sample_width=AUDIO_SAMPLE_WIDTH,
+                frame_rate=data['sample_rate'],
+                channels=AUDIO_CHANNELS
+            )
+            if seg.frame_rate != target_rate:
+                seg = seg.set_frame_rate(target_rate)
+            combined += seg
+            logger.debug(f"Fala adicionada (segmento {idx}): {len(seg)/1000:.2f}s")
+
+        elif 'effect' in data:
+            # Efeito (do cache)
+            effect_file = data['effect']
+            if not effect_file.endswith('.wav'):
+                effect_file += '.wav'
+
+            seg = load_effect_to_cache(effect_file)
+            if seg is not None:
+                combined += seg
+                logger.debug(f"Efeito adicionado (segmento {idx}): {effect_file} ({len(seg)/1000:.2f}s)")
+            else:
+                logger.warning(f"Efeito ignorado (segmento {idx}): {effect_file}")
+
+        else:
+            logger.warning(f"Segmento {idx} ignorado: tipo desconhecido")
+
+    if len(combined) == 0:
+        raise RuntimeError("Nenhum áudio foi gerado.")
+
+    # Normalização (opcional)
+    target_dbfs = -20.0
+    try:
+        if combined.dBFS != target_dbfs:
+            combined = combined.apply_gain(target_dbfs - combined.dBFS)
+            logger.debug(f"Normalizado: ganho {target_dbfs - combined.dBFS:.1f}dB")
+    except Exception as e:
+        logger.warning(f"Normalização ignorada: {e}")
+
+    # Ambiente (se habilitado)
+    if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
+        ambient_file = ambient_cfg['file']
+        ambient_path = AMBIENT_DIR / f"{ambient_file}.wav"
+        if ambient_path.exists():
+            try:
+                ambient = AudioSegment.from_wav(str(ambient_path))
+                ambient = ambient.set_channels(AUDIO_CHANNELS).set_frame_rate(target_rate)
+                ambient = ambient + ambient_cfg.get('volume_db', -15.0)
+                if len(ambient) < len(combined):
+                    ambient = ambient * ((len(combined) // len(ambient)) + 1)
+                ambient = ambient[:len(combined)]
+                combined = combined.overlay(ambient)
+                logger.debug(f"Ambiente aplicado: {ambient_file}")
+            except Exception as e:
+                logger.error(f"Erro ao aplicar ambiente {ambient_file}: {e}")
+        else:
+            logger.warning(f"Ambiente '{ambient_file}.wav' não encontrado.")
+
+    # Exporta para WAV
+    with io.BytesIO() as buf:
+        combined.export(buf, format="wav")
+        wav_bytes = buf.getvalue()
+
+    t_total = time.perf_counter() - t0
+    logger.info(f"Concatenação (pydub): {t_total:.3f}s | {len(segments_data)} segmentos")
 
     try:
-        for data in segments_data:
-            if 'pcm_bytes' in data:
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    wav_path = f.name
-                with wave.open(wav_path, 'wb') as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(data['sample_rate'])
-                    wav_file.writeframes(data['pcm_bytes'])
-                temp_files.append(wav_path)
-                logger.debug(f"Segmento PCM: {wav_path}")
+        cpu_id = os.sched_getaffinity(0)
+        cpu_id = next(iter(cpu_id))
+        update_worker_stats("mix", cpu_id, t_total)
+    except:
+        pass
 
-            elif 'effect' in data:
-                effect_file = data['effect']
-                # Garante extensão .wav
-                if not effect_file.endswith('.wav'):
-                    effect_file = effect_file + '.wav'
-
-                if effect_file in EFFECTS_CACHE:
-                    wav_bytes = EFFECTS_CACHE[effect_file]
-                else:
-                    # Fallback: tenta carregar do disco
-                    voice_dir = VOICES_DIR / data['voice']
-                    effect_path = voice_dir / effect_file
-                    if not effect_path.exists():
-                        effect_path = EFFECTS_DIR / effect_file
-                    if not effect_path.exists():
-                        logger.warning(f"Efeito '{effect_file}' não encontrado, ignorando.")
-                        continue
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", str(effect_path),
-                        "-ar", str(target_rate),
-                        "-ac", "1",
-                        "-c:a", "pcm_s16le",
-                        "-f", "wav",
-                        "pipe:1"
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
-                    wav_bytes = result.stdout
-
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    f.write(wav_bytes)
-                    temp_files.append(f.name)
-                    logger.debug(f"Efeito: {f.name}")
-
-        if not temp_files:
-            raise ValueError("Nenhum arquivo para processar")
-
-        # Concatenação
-        if len(temp_files) == 1:
-            with open(temp_files[0], 'rb') as f:
-                concat_bytes = f.read()
-        else:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as list_file:
-                for f in temp_files:
-                    list_file.write(f"file '{f}'\n")
-                list_path = list_file.name
-
-            concat_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_path,
-                "-c", "copy",
-                "-f", "wav",
-                "pipe:1"
-            ]
-            result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
-            concat_bytes = result.stdout
-            os.unlink(list_path)
-
-        # Ambiente (se habilitado)
-        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
-            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if ambient_path.exists():
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    ambient_temp = f.name
-                subprocess.run([
-                    "ffmpeg", "-y",
-                    "-i", str(ambient_path),
-                    "-ar", str(target_rate),
-                    "-ac", "1",
-                    "-c:a", "pcm_s16le",
-                    ambient_temp
-                ], capture_output=True, check=True, timeout=5)
-
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    f.write(concat_bytes)
-                    concat_temp = f.name
-
-                mix_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", concat_temp,
-                    "-i", ambient_temp,
-                    "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.4",
-                    "-ar", str(target_rate),
-                    "-ac", "1",
-                    "-c:a", "pcm_s16le",
-                    "-f", "wav",
-                    "pipe:1"
-                ]
-                result = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
-                final_wav = result.stdout
-
-                os.unlink(ambient_temp)
-                os.unlink(concat_temp)
-            else:
-                logger.warning(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado.")
-                final_wav = concat_bytes
-        else:
-            final_wav = concat_bytes
-
-        # Limpeza
-        for f in temp_files:
-            try:
-                os.unlink(f)
-            except:
-                pass
-
-        t_total = time.perf_counter() - t0
-        logger.info(f"Concatenação + mixagem: {t_total:.3f}s | {len(temp_files)} segmentos")
-
-        try:
-            cpu_id = os.sched_getaffinity(0)
-            cpu_id = next(iter(cpu_id))
-            update_worker_stats("mix", cpu_id, t_total)
-        except:
-            pass
-
-        return final_wav, t_total
-
-    except Exception as e:
-        logger.error(f"Erro na mixagem/concatenação: {e}")
-        for f in temp_files:
-            try:
-                os.unlink(f)
-            except:
-                pass
-        raise
+    return wav_bytes, t_total
 
 # ============================================================================
-# 15. PROCESSAMENTO TTS (GERA SEGMENTOS)
+# 16. PROCESSAMENTO TTS (GERA SEGMENTOS)
 # ============================================================================
 def process_tts_only(
     voice_name: Optional[str],
@@ -569,6 +519,10 @@ def process_tts_only(
     speakers: List[Dict],
     enqueue_time: float,
 ) -> Tuple[List[Dict], Dict[str, float]]:
+    """
+    Sintetiza todos os fragmentos de uma requisição.
+    Retorna uma lista de segmentos (PCM ou efeito) e métricas.
+    """
     t_worker_start = time.perf_counter()
     queue_wait = t_worker_start - enqueue_time
 
@@ -593,23 +547,24 @@ def process_tts_only(
     synth_time_total = 0.0
 
     for part in parts:
+        # Detecção de papel (apenas em modo diálogo)
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
             continue
 
-        # --- EFEITO ---
+        # Efeito sonoro
         if part in effects:
             effect_file = effects[part]
             if not effect_file.endswith('.wav'):
-                effect_file = effect_file + '.wav'
+                effect_file += '.wav'
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
-            logger.debug(f"Efeito adicionado: {effect_file}")
+            logger.debug(f"Efeito agendado: {effect_file}")
             continue
 
-        # --- FALA ---
+        # Fala
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -624,7 +579,7 @@ def process_tts_only(
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
-        logger.debug(f"Fala adicionada: '{part[:30]}...'")
+        logger.debug(f"Fala sintetizada: '{part[:30]}...'")
 
     total_worker_time = time.perf_counter() - t_worker_start
 
@@ -645,7 +600,7 @@ def process_tts_only(
     return segments, metrics
 
 # ============================================================================
-# 16. POOLS DE PROCESSOS
+# 17. POOLS DE PROCESSOS
 # ============================================================================
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
@@ -659,7 +614,7 @@ mix_pool = ProcessPoolExecutor(
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
 # ============================================================================
-# 17. MODELOS PYDANTIC
+# 18. MODELOS PYDANTIC
 # ============================================================================
 class AmbientConfig(BaseModel):
     enabled: bool = False
@@ -684,9 +639,9 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ============================================================================
-# 18. FASTAPI APP
+# 19. FASTAPI APP
 # ============================================================================
-app = FastAPI(title="Piper TTS API (Otimizada)")
+app = FastAPI(title="Piper TTS API (Otimizada - pydub)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
@@ -699,7 +654,7 @@ def json_response(data: Any, status_code: int = 200) -> JSONResponse:
     )
 
 # ============================================================================
-# 19. ENDPOINT PRINCIPAL
+# 20. ENDPOINT PRINCIPAL
 # ============================================================================
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -727,6 +682,7 @@ async def synthesize(req: TTSRequest):
         enqueue_time = time.perf_counter()
         loop = asyncio.get_running_loop()
 
+        # Etapa 1: TTS (síntese) no pool TTS
         tts_future = loop.run_in_executor(
             tts_pool,
             process_tts_only,
@@ -741,6 +697,7 @@ async def synthesize(req: TTSRequest):
         )
         segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
 
+        # Etapa 2: Mixagem/concatenação no pool MIX (separado)
         mix_future = loop.run_in_executor(
             mix_pool,
             mix_and_export_task,
@@ -782,7 +739,7 @@ async def synthesize(req: TTSRequest):
             request_semaphore.release()
 
 # ============================================================================
-# 20. ENDPOINTS DE DIAGNÓSTICO
+# 21. ENDPOINTS DE DIAGNÓSTICO
 # ============================================================================
 @app.get("/stats")
 async def get_stats():
@@ -985,7 +942,7 @@ async def set_physical_cores(req: SetPhysicalCoresRequest):
     })
 
 # ============================================================================
-# 21. ENDPOINTS DE SAÚDE
+# 22. ENDPOINTS DE SAÚDE
 # ============================================================================
 @app.get("/started")
 async def started():
@@ -1014,7 +971,7 @@ async def health():
     })
 
 # ============================================================================
-# 22. PONTO DE ENTRADA
+# 23. PONTO DE ENTRADA
 # ============================================================================
 if __name__ == "__main__":
     import uvicorn
