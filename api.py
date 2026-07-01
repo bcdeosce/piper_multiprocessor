@@ -7,6 +7,7 @@ import logging
 import subprocess
 import tempfile
 import wave
+import io
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
@@ -152,6 +153,59 @@ if TTS_WORKERS > len(PHYSICAL_CORES):
     TTS_WORKERS = len(PHYSICAL_CORES)
 
 logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
+
+
+#---------- Pré-carrega os efeitos
+
+def preload_effects():
+    """Carrega todos os efeitos disponíveis e os normaliza para mono, target_rate, PCM 16-bit."""
+    logger.info("Pré-carregando efeitos...")
+    target_rate = 22050
+    # Procura efeitos no diretório global
+    for effect_file in EFFECTS_DIR.glob("*.wav"):
+        effect_name = effect_file.name
+        try:
+            # Carrega com FFmpeg e normaliza
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(effect_file),
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ]
+            result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
+            EFFECTS_CACHE[effect_name] = result.stdout
+            logger.info(f"Efeito pré-carregado: {effect_name}")
+        except Exception as e:
+            logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
+
+    # Também procura efeitos nas pastas das vozes
+    for voice_name, voice_data in VOICE_PATHS.items():
+        voice_dir = VOICES_DIR / voice_name
+        for effect_file in voice_dir.glob("*.wav"):
+            effect_name = effect_file.name
+            if effect_name in EFFECTS_CACHE:
+                continue
+            try:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(effect_file),
+                    "-ar", str(target_rate),
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    "-f", "wav",
+                    "pipe:1"
+                ]
+                result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
+                EFFECTS_CACHE[effect_name] = result.stdout
+                logger.info(f"Efeito pré-carregado (voz): {effect_name}")
+            except Exception as e:
+                logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
+
+    logger.info(f"Total de efeitos pré-carregados: {len(EFFECTS_CACHE)}")
+
 
 # ---------- Estatísticas dos workers ----------
 manager = mp.Manager()
@@ -310,6 +364,7 @@ def load_all_voices():
             logger.info(f"Voz personalizada registrada: {voice_name}")
 
 load_all_voices()
+preload_effects()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
 def get_voice_pool(voice_name):
@@ -347,9 +402,9 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     temp_files = []
 
     try:
-        # 1. Cria arquivos temporários para TODOS os segmentos (fala + efeitos)
-        for idx, data in enumerate(segments_data):
+        for data in segments_data:
             if 'pcm_bytes' in data:
+                # Segmento de fala (PCM já está no formato correto)
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
                 with wave.open(wav_path, 'wb') as wav_file:
@@ -358,93 +413,110 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     wav_file.setframerate(data['sample_rate'])
                     wav_file.writeframes(data['pcm_bytes'])
                 temp_files.append(wav_path)
-                logger.debug(f"Segmento {idx}: PCM")
 
             elif 'effect' in data:
-                voice_dir = VOICES_DIR / data['voice']
-                effect_path = voice_dir / data['effect']
-                if not effect_path.exists():
-                    effect_path = EFFECTS_DIR / data['effect']
-                if not effect_path.exists():
-                    logger.warning(f"Efeito '{data['effect']}' não encontrado, ignorando.")
-                    continue
-                # Copia o efeito para um temporário (garante consistência)
+                effect_file = data['effect']
+                # Verifica se o efeito está no cache
+                if effect_file in EFFECTS_CACHE:
+                    wav_bytes = EFFECTS_CACHE[effect_file]
+                else:
+                    # Fallback: tenta carregar do disco (pode acontecer se um efeito não foi pré-carregado)
+                    voice_dir = VOICES_DIR / data['voice']
+                    effect_path = voice_dir / effect_file
+                    if not effect_path.exists():
+                        effect_path = EFFECTS_DIR / effect_file
+                    if not effect_path.exists():
+                        logger.warning(f"Efeito '{effect_file}' não encontrado, ignorando.")
+                        continue
+                    # Carrega e normaliza na hora (mais lento, mas raro)
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(effect_path),
+                        "-ar", str(target_rate),
+                        "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        "-f", "wav",
+                        "pipe:1"
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
+                    wav_bytes = result.stdout
+
+                # Salva os bytes do efeito em um arquivo temporário
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    with open(effect_path, 'rb') as src:
-                        f.write(src.read())
+                    f.write(wav_bytes)
                     temp_files.append(f.name)
-                    logger.debug(f"Segmento {idx}: Efeito {data['effect']}")
 
         if not temp_files:
             raise ValueError("Nenhum arquivo para processar")
 
-        # 2. Concatenação com FFmpeg (ordem correta)
-        # Se houver apenas 1 arquivo, não precisa de filtro
+        # Concatenação com demuxer concat (mais rápido)
         if len(temp_files) == 1:
             with open(temp_files[0], 'rb') as f:
                 concat_bytes = f.read()
         else:
-            concat_cmd = ["ffmpeg", "-y"]
-            for f in temp_files:
-                concat_cmd.extend(["-i", f])
-            concat_cmd.extend([
-                "-filter_complex", f"concat=n={len(temp_files)}:v=0:a=1",
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                "-f", "wav",
-                "pipe:1"
-            ])
-            result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
-            concat_bytes = result.stdout
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as list_file:
+                for f in temp_files:
+                    list_file.write(f"file '{f}'\n")
+                list_path = list_file.name
 
-        # 3. Se ambiente habilitado, mixa sobre o áudio concatenado
-        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
-            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if not ambient_path.exists():
-                logger.warning(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado, ignorando.")
-                return concat_bytes, time.perf_counter() - t0
-
-            # Prepara o ambiente (mono, target_rate)
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                ambient_temp = f.name
-            subprocess.run([
+            concat_cmd = [
                 "ffmpeg", "-y",
-                "-i", str(ambient_path),
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                ambient_temp
-            ], capture_output=True, check=True)
-
-            # Salva o áudio concatenado em um arquivo temporário para o amix
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                f.write(concat_bytes)
-                concat_temp = f.name
-
-            # Mixa: concatenado + ambiente
-            mix_cmd = [
-                "ffmpeg", "-y",
-                "-i", concat_temp,
-                "-i", ambient_temp,
-                "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.4",
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
                 "-f", "wav",
                 "pipe:1"
             ]
-            result = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
-            final_wav = result.stdout
+            result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
+            concat_bytes = result.stdout
+            os.unlink(list_path)
 
-            # Limpa temporários
-            os.unlink(ambient_temp)
-            os.unlink(concat_temp)
+        # Ambiente (se habilitado)
+        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
+            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
+            if ambient_path.exists():
+                # Prepara o ambiente
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    ambient_temp = f.name
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", str(ambient_path),
+                    "-ar", str(target_rate),
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    ambient_temp
+                ], capture_output=True, check=True, timeout=5)
 
+                # Salva concat_bytes em temporário
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    f.write(concat_bytes)
+                    concat_temp = f.name
+
+                # Mixa
+                mix_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", concat_temp,
+                    "-i", ambient_temp,
+                    "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.4",
+                    "-ar", str(target_rate),
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    "-f", "wav",
+                    "pipe:1"
+                ]
+                result = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
+                final_wav = result.stdout
+
+                os.unlink(ambient_temp)
+                os.unlink(concat_temp)
+            else:
+                logger.warning(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado.")
+                final_wav = concat_bytes
         else:
             final_wav = concat_bytes
 
-        # 4. Limpeza dos temporários
+        # Limpeza
         for f in temp_files:
             try:
                 os.unlink(f)
@@ -452,6 +524,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 pass
 
         t_total = time.perf_counter() - t0
+        logger.info(f"Concatenação + mixagem: {t_total:.3f}s | {len(temp_files)} segmentos")
 
         try:
             cpu_id = os.sched_getaffinity(0)
@@ -462,18 +535,14 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         return final_wav, t_total
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg erro: {e.stderr.decode()}")
-        raise RuntimeError("Falha no processamento com FFmpeg")
     except Exception as e:
-        logger.error(f"Erro inesperado: {e}")
-        raise
-    finally:
+        logger.error(f"Erro na mixagem/concatenação: {e}")
         for f in temp_files:
             try:
                 os.unlink(f)
             except:
                 pass
+        raise
 # ---------- Processamento TTS ----------
 def process_tts_only(
     voice_name: Optional[str],
