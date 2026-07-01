@@ -343,15 +343,11 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
 
 # ---------- Mixagem ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
-    """
-    Concatena os segmentos de áudio (fala + efeitos) na ordem em que aparecem,
-    e depois (opcionalmente) mixa com o áudio ambiente de fundo.
-    """
     t0 = time.perf_counter()
     temp_files = []
+    ffmpeg_cmd = ["ffmpeg", "-y"]
 
     try:
-        # 1. Cria arquivos temporários para cada segmento (mantendo a ordem)
         for data in segments_data:
             if 'pcm_bytes' in data:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -362,7 +358,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     wav_file.setframerate(data['sample_rate'])
                     wav_file.writeframes(data['pcm_bytes'])
                 temp_files.append(wav_path)
-                logger.debug(f"Segmento PCM adicionado: {wav_path}")
 
             elif 'effect' in data:
                 voice_dir = VOICES_DIR / data['voice']
@@ -371,114 +366,44 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     effect_path = EFFECTS_DIR / data['effect']
                 if not effect_path.exists():
                     raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
-                # Copia o arquivo de efeito para um temporário (para consistência)
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     with open(effect_path, 'rb') as src:
                         f.write(src.read())
                     temp_files.append(f.name)
-                    logger.debug(f"Efeito adicionado: {f.name}")
             else:
                 continue
 
-        if not temp_files:
-            raise ValueError("Nenhum arquivo para processar")
-
-        # 2. Concatenação usando o demuxer concat (mais robusto e rápido)
-        if len(temp_files) == 1:
-            concat_output = temp_files[0]
-        else:
-            # Cria um arquivo de lista para o demuxer concat
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as list_file:
-                for f in temp_files:
-                    list_file.write(f"file '{f}'\n")
-                list_path = list_file.name
-
-            concat_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_path,
-                "-c", "copy",           # Copia os streams sem recodificar (mais rápido)
-                "-f", "wav",
-                "pipe:1"
-            ]
-            try:
-                result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
-                concat_bytes = result.stdout
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg concat erro: {e.stderr.decode()}")
-                raise RuntimeError("Falha na concatenação dos segmentos")
-            finally:
-                os.unlink(list_path)
-
-            # Salva o resultado concatenado em um novo arquivo temporário
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                f.write(concat_bytes)
-                concat_output = f.name
-
-        # 3. Se o ambiente estiver habilitado, mixa com o áudio ambiente
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if not ambient_path.exists():
-                raise FileNotFoundError(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado")
+            if ambient_path.exists():
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    with open(ambient_path, 'rb') as src:
+                        f.write(src.read())
+                    temp_files.append(f.name)
 
-            # Prepara o ambiente para o mesmo formato (mono, target_rate)
-            ambient_adjusted = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            ambient_adjusted_path = ambient_adjusted.name
-            ambient_adjusted.close()
+        if not temp_files:
+            raise ValueError("Nenhum arquivo para mixar")
 
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", str(ambient_path),
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                ambient_adjusted_path
-            ], capture_output=True, check=True)
-
-            # Mixa o áudio concatenado com o ambiente (sobreposição)
-            mix_cmd = [
-                "ffmpeg", "-y",
-                "-i", concat_output,
-                "-i", ambient_adjusted_path,
-                "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.5",
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                "-f", "wav",
-                "pipe:1"
-            ]
-            try:
-                result = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
-                final_wav = result.stdout
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg mix erro: {e.stderr.decode()}")
-                raise RuntimeError("Falha na mixagem com ambiente")
-            finally:
-                os.unlink(ambient_adjusted_path)
-
-            # Remove o arquivo de concatenação (se não for o mesmo que o original)
-            if len(temp_files) > 1:
-                os.unlink(concat_output)
-
-        else:
-            # Sem ambiente: usa o áudio concatenado diretamente
-            with open(concat_output, 'rb') as f:
-                final_wav = f.read()
-            if len(temp_files) > 1:
-                os.unlink(concat_output)
-
-        # 4. Limpeza dos arquivos temporários dos segmentos
+        # Monta comando FFmpeg com concatenação (ordem correta)
         for f in temp_files:
-            try:
-                os.unlink(f)
-            except:
-                pass
+            ffmpeg_cmd.extend(["-i", f])
+
+        # SUBSTITUIÇÃO: amix → concat
+        filter_complex = f"concat=n={len(temp_files)}:v=0:a=1"
+        ffmpeg_cmd.extend([
+            "-filter_complex", filter_complex,
+            "-ar", str(target_rate),
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            "-f", "wav",
+            "pipe:1"
+        ])
+
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=10)
+        wav_bytes = result.stdout
 
         t_total = time.perf_counter() - t0
-        logger.info(f"Concatenação + mixagem concluída em {t_total:.3f}s | {len(temp_files)} segmentos")
 
-        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
@@ -486,17 +411,17 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         except:
             pass
 
-        return final_wav, t_total
+        return wav_bytes, t_total
 
-    except Exception as e:
-        # Em caso de erro, garante a limpeza
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg erro: {e.stderr.decode()}")
+        raise RuntimeError("Falha na concatenação/mixagem com FFmpeg")
+    finally:
         for f in temp_files:
             try:
                 os.unlink(f)
             except:
                 pass
-        raise
-
 # ---------- Processamento TTS ----------
 def process_tts_only(
     voice_name: Optional[str],
