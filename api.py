@@ -32,12 +32,18 @@ def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs
 
 ort.InferenceSession = _patched_ort_session
 
-# ---------- Instalação automática do psutil ----------
+# ---------- Instalação automática de dependências ----------
 try:
     import psutil
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
     import psutil
+
+try:
+    import aiohttp
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp"])
+    import aiohttp
 
 try:
     from piper import PiperVoice, SynthesisConfig
@@ -52,7 +58,6 @@ from pydantic import BaseModel, Field
 
 # ---------- Configuração de logs com buffer em memória ----------
 class MemoryHandler(logging.Handler):
-    """Guarda as últimas N mensagens de log em memória (apenas WARNING+)."""
     def __init__(self, capacity=100):
         super().__init__()
         self.capacity = capacity
@@ -66,7 +71,6 @@ class MemoryHandler(logging.Handler):
 memory_handler = MemoryHandler(capacity=100)
 memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 
-# Configura o logger
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -77,8 +81,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("piper-api")
 logger.setLevel(logging.INFO)
-
-# Ajusta o nível do handler de memória para WARNING+
 memory_handler.setLevel(logging.WARNING)
 
 ort.set_default_logger_severity(3)
@@ -181,7 +183,7 @@ logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 # ---------- GERENCIADOR COMPARTILHADO ----------
 manager = mp.Manager()
 
-# Estatísticas dos workers (por processo)
+# Estatísticas dos workers
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
 
@@ -191,6 +193,16 @@ bench_stats = {
     "tts_wall": manager.list(),
     "mix": manager.list(),
     "queue_wait": manager.list(),
+    # Métricas detalhadas da mixagem
+    "mix_temp_files_creation": manager.list(),
+    "mix_concat_time": manager.list(),
+    "mix_ambient_loop_time": manager.list(),
+    "mix_ambient_trim_time": manager.list(),
+    "mix_amix_time": manager.list(),
+    "mix_cleanup_time": manager.list(),
+    "mix_total_mix_time": manager.list(),
+    "num_segments": manager.list(),
+    "synth_time": manager.list(),
 }
 bench_stats_lock = mp.Lock()
 
@@ -253,7 +265,6 @@ def _init_tts_worker():
     mod._worker_cpu_id = cpu_id
     mod._worker_voice_cache = {}
 
-    # PRÉ-CARREGAMENTO DE TODAS AS VOZES
     logger.info(f"Worker {pid} iniciando pré-carregamento de {len(VOICE_PATHS)} vozes...")
     load_start = time.perf_counter()
     for voice_name in VOICE_PATHS.keys():
@@ -263,7 +274,6 @@ def _init_tts_worker():
             logger.error(f"  Falha ao carregar voz '{voice_name}': {e}")
     load_time = time.perf_counter() - load_start
     logger.info(f"Worker {pid} pré-carregou {len(VOICE_PATHS)} vozes em {load_time:.2f}s")
-
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado e pronto")
 
 # ---------- Inicializador Mix ----------
@@ -858,6 +868,15 @@ async def synthesize(req: TTSRequest):
             bench_stats["tts_wall"].append(tts_metrics['tts_worker_time'])
             bench_stats["mix"].append(mix_metrics['total_mix_time'])
             bench_stats["queue_wait"].append(tts_metrics['queue_wait'])
+            bench_stats["synth_time"].append(tts_metrics['synth_time'])
+            bench_stats["num_segments"].append(tts_metrics['num_segments'])
+            bench_stats["mix_temp_files_creation"].append(mix_metrics['temp_files_creation'])
+            bench_stats["mix_concat_time"].append(mix_metrics['concat_time'])
+            bench_stats["mix_ambient_loop_time"].append(mix_metrics['ambient_loop_time'])
+            bench_stats["mix_ambient_trim_time"].append(mix_metrics['ambient_trim_time'])
+            bench_stats["mix_amix_time"].append(mix_metrics['amix_time'])
+            bench_stats["mix_cleanup_time"].append(mix_metrics['cleanup_time'])
+            bench_stats["mix_total_mix_time"].append(mix_metrics['total_mix_time'])
 
         logger.info(
             f"⏱️ Requisição: total={total_time:.3f}s | "
@@ -870,9 +889,38 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
-# ---------- ENDPOINTS DE DIAGNÓSTICO ----------
+# ================= ENDPOINTS DE DIAGNÓSTICO =================
 
-# 1. BENCH
+# 1. STATS (com todas as métricas detalhadas)
+@app.get("/stats")
+async def get_stats():
+    with bench_stats_lock:
+        if not bench_stats["total"]:
+            return Response(
+                content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2),
+                media_type="application/json"
+            )
+        report = {
+            "total": compute_stats(list(bench_stats["total"])),
+            "tts_wall": compute_stats(list(bench_stats["tts_wall"])),
+            "mix": compute_stats(list(bench_stats["mix"])),
+            "queue_wait": compute_stats(list(bench_stats["queue_wait"])),
+            "synth_time": compute_stats(list(bench_stats["synth_time"])),
+            "num_segments": compute_stats(list(bench_stats["num_segments"])),
+            "mix_temp_files_creation": compute_stats(list(bench_stats["mix_temp_files_creation"])),
+            "mix_concat_time": compute_stats(list(bench_stats["mix_concat_time"])),
+            "mix_ambient_loop_time": compute_stats(list(bench_stats["mix_ambient_loop_time"])),
+            "mix_ambient_trim_time": compute_stats(list(bench_stats["mix_ambient_trim_time"])),
+            "mix_amix_time": compute_stats(list(bench_stats["mix_amix_time"])),
+            "mix_cleanup_time": compute_stats(list(bench_stats["mix_cleanup_time"])),
+            "mix_total_mix_time": compute_stats(list(bench_stats["mix_total_mix_time"])),
+        }
+    return Response(
+        content=json.dumps(report, indent=2),
+        media_type="application/json"
+    )
+
+# 2. BENCH
 @app.get("/bench")
 async def get_bench():
     with bench_stats_lock:
@@ -901,35 +949,7 @@ async def get_bench():
         media_type="application/json"
     )
 
-# 2. STATS (agora funcionando)
-@app.get("/stats")
-async def get_stats():
-    with bench_stats_lock:
-        if not bench_stats["total"]:
-            return Response(
-                content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2),
-                media_type="application/json"
-            )
-        report = {
-            "total": compute_stats(list(bench_stats["total"])),
-            "tts_wall": compute_stats(list(bench_stats["tts_wall"])),
-            "mix": compute_stats(list(bench_stats["mix"])),
-            "queue_wait": compute_stats(list(bench_stats["queue_wait"])),
-        }
-    return Response(
-        content=json.dumps(report, indent=2),
-        media_type="application/json"
-    )
-
-# 3. LOGS (em memória)
-@app.get("/logs")
-async def get_logs():
-    return Response(
-        content=json.dumps({"logs": memory_handler.buffer}, indent=2),
-        media_type="application/json"
-    )
-
-# 4. WORKERS (detalhado)
+# 3. WORKERS
 @app.get("/workers")
 async def get_workers():
     with worker_stats_lock:
@@ -959,12 +979,142 @@ async def get_workers():
         media_type="application/json"
     )
 
-# 5. RESOURCES
+# 4. POOL_STATUS (RESTAURADO)
+@app.get("/pool_status")
+async def pool_status():
+    with worker_stats_lock:
+        tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
+        mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
+    with bench_stats_lock:
+        total_requests = len(bench_stats["total"])
+    return Response(
+        content=json.dumps({
+            "tts_workers": TTS_WORKERS,
+            "mix_workers": MIX_WORKERS,
+            "tts_registered": tts_count,
+            "mix_registered": mix_count,
+            "physical_cores": PHYSICAL_CORES,
+            "hyper_thread_cores": HYPER_THREAD_CORES,
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "request_timeout": REQUEST_TIMEOUT,
+            "current_concurrency": request_semaphore._value if request_semaphore and hasattr(request_semaphore, '_value') else "disabled",
+            "total_requests_processed": total_requests,
+        }, indent=2),
+        media_type="application/json"
+    )
+
+# 5. DIAGNOSE_CORES (RESTAURADO)
+@app.get("/diagnose_cores")
+async def diagnose_cores():
+    try:
+        cpuinfo = []
+        with open('/proc/cpuinfo', 'r') as f:
+            lines = f.readlines()
+        current = {}
+        for line in lines:
+            if line.strip() == '':
+                if current:
+                    cpuinfo.append(current)
+                    current = {}
+                continue
+            key, val = line.split(':', 1)
+            current[key.strip()] = val.strip()
+        if current:
+            cpuinfo.append(current)
+
+        cores_map = {}
+        for cpu in cpuinfo:
+            if 'processor' in cpu and 'core id' in cpu:
+                proc = int(cpu['processor'])
+                core = int(cpu['core id'])
+                cores_map.setdefault(core, []).append(proc)
+
+        siblings = {}
+        for cpu in ALL_CORES:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            try:
+                with open(path, 'r') as f:
+                    siblings[cpu] = f.read().strip()
+            except:
+                siblings[cpu] = str(cpu)
+
+        workers_info = []
+        for key, data in worker_stats.items():
+            worker_type, worker_id = key.split('_')
+            pid = data["pid"]
+            cpu_id = data["cpu_id"]
+            is_physical = data.get("is_physical", False)
+
+            try:
+                proc = psutil.Process(pid)
+                affinity = proc.cpu_affinity()
+                num_threads = len(proc.threads())
+                has_multiple_threads = num_threads > 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                affinity = "N/A"
+                num_threads = "N/A"
+                has_multiple_threads = "N/A"
+
+            workers_info.append({
+                "type": worker_type,
+                "id": int(worker_id),
+                "pid": pid,
+                "assigned_cpu": cpu_id,
+                "is_physical": is_physical,
+                "real_affinity": affinity,
+                "num_threads": num_threads,
+                "has_multiple_threads": has_multiple_threads,
+                "requests_processed": data["requests_processed"],
+                "avg_time": data["avg_time"],
+            })
+
+        physical_from_proc = sorted([min(cpus) for cpus in cores_map.values()]) if cores_map else []
+        physical_from_sys = []
+        for cpu in ALL_CORES:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            try:
+                with open(path, 'r') as f:
+                    sibs = f.read().strip().split(',')
+                    if int(sibs[0]) == cpu:
+                        physical_from_sys.append(cpu)
+            except:
+                pass
+        physical_from_sys = sorted(set(physical_from_sys))
+
+        return Response(
+            content=json.dumps({
+                "total_cores": os.cpu_count(),
+                "cores_map": cores_map,
+                "siblings": siblings,
+                "physical_cores_from_proc": physical_from_proc,
+                "physical_cores_from_sys": physical_from_sys,
+                "current_physical_cores": PHYSICAL_CORES,
+                "current_hyper_thread_cores": HYPER_THREAD_CORES,
+                "workers": workers_info,
+                "workers_with_multiple_threads": [w for w in workers_info if w.get("has_multiple_threads") is True],
+                "analysis": {
+                    "threading_issue": any(w.get("has_multiple_threads") is True for w in workers_info),
+                    "affinity_mismatch": any(
+                        w.get("real_affinity") != "N/A" and w.get("assigned_cpu") not in w.get("real_affinity", [])
+                        for w in workers_info
+                    )
+                }
+            }, indent=2),
+            media_type="application/json"
+        )
+    except Exception as e:
+        logger.error(f"Erro no diagnose: {e}")
+        return Response(
+            content=json.dumps({"error": str(e)}, indent=2),
+            status_code=500,
+            media_type="application/json"
+        )
+
+# 6. RESOURCES
 @app.get("/resources")
 async def get_resources():
     cpu_util = -1.0
     try:
-        import psutil
         cpu_util = psutil.cpu_percent(interval=0.1)
     except:
         pass
@@ -982,7 +1132,7 @@ async def get_resources():
         media_type="application/json"
     )
 
-# 6. RESET_STATS
+# 7. RESET_STATS
 @app.post("/reset_stats")
 async def reset_stats():
     with bench_stats_lock:
@@ -1000,7 +1150,15 @@ async def reset_stats():
         media_type="application/json"
     )
 
-# 7. CARGA (resultados do teste de carga)
+# 8. LOGS
+@app.get("/logs")
+async def get_logs():
+    return Response(
+        content=json.dumps({"logs": memory_handler.buffer}, indent=2),
+        media_type="application/json"
+    )
+
+# 9. CARGA
 @app.get("/carga")
 async def get_carga():
     if not BENCH_DIR.exists():
@@ -1025,7 +1183,7 @@ async def get_carga():
         media_type="application/json"
     )
 
-# 8. CARGA_FILES
+# 10. CARGA_FILES
 @app.get("/carga_files")
 async def list_carga_files():
     if not BENCH_DIR.exists():
@@ -1036,7 +1194,7 @@ async def list_carga_files():
         media_type="application/json"
     )
 
-# 9. CARGA/{FILE_NAME}
+# 11. CARGA/{FILE_NAME}
 @app.get("/carga/{file_name}")
 async def get_carga_file(file_name: str):
     file_path = BENCH_DIR / file_name
@@ -1046,7 +1204,7 @@ async def get_carga_file(file_name: str):
         data = json.load(f)
     return Response(content=json.dumps(data, indent=2), media_type="application/json")
 
-# 10. RUN_LOAD_TEST (teste de carga local via POST)
+# 12. RUN_LOAD_TEST (com suporte a speakers e instalação automática do aiohttp)
 @app.post("/run_load_test")
 async def run_load_test(
     ramp_max: int = 51,
@@ -1071,14 +1229,11 @@ async def run_load_test(
     import aiohttp, statistics, random
     from contextlib import asynccontextmanager
 
-    # Se speakers for fornecido, usa modo diálogo
     use_speakers = speakers is not None and len(speakers) > 0
 
-    # Se voice não for fornecido e speakers não for usado, pega a primeira voz disponível
     if not use_speakers and voice is None:
         voice = list(VOICE_PATHS.keys())[0] if VOICE_PATHS else "crianca"
 
-    # Efeitos padrão
     if effects is None:
         effects = {
             "[tosse]": "tosse.wav",
@@ -1086,7 +1241,6 @@ async def run_load_test(
             "[inspiracao]": "inspiracao.wav"
         }
 
-    # Diálogos padrão (com tags [paciente] e [acompanhante])
     if dialogs is None:
         dialogs = [
             "[paciente] Estou com dor de cabeça forte. [tosse] Ele está assim há três dias, doutor.",
@@ -1125,7 +1279,6 @@ async def run_load_test(
                 while time.perf_counter() - start < duration:
                     async with sem:
                         d = random.choice(dialogs)
-                        # Monta o payload
                         payload = {
                             "text": d,
                             "effects": effects,
@@ -1199,7 +1352,6 @@ async def run_load_test(
         }, indent=2),
         media_type="application/json"
     )
-
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
