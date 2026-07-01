@@ -50,13 +50,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------- Configuração de logs ----------
+# ---------- Configuração de logs (nível DEBUG para diagnóstico) ----------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Mudado para DEBUG para capturar detalhes
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
-
+# Ajusta nível do ONNX para não poluir
 ort.set_default_logger_severity(3)
 
 BASE_DIR = Path("/app")
@@ -87,6 +87,7 @@ def convert_audio_to_target(file_path: Path) -> bool:
         ]
         subprocess.run(cmd, capture_output=True, check=True)
         os.replace(str(file_path) + ".tmp", str(file_path))
+        logger.debug(f"Áudio convertido: {file_path}")
         return True
     except Exception as e:
         logger.error(f"Erro ao converter {file_path}: {e}")
@@ -390,6 +391,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
         chunk_generator = voice.synthesize(text, syn_config=config)
         audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
         sample_rate = voice.config.sample_rate
+        logger.debug(f"Síntese de '{text[:30]}...' OK: {len(audio_bytes)} bytes, {sample_rate}Hz")
         return sample_rate, audio_bytes
     finally:
         pool.put(voice)
@@ -400,9 +402,11 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
     temp_files = []
     ffmpeg_cmd = ["ffmpeg", "-y"]
 
+    logger.debug(f"Iniciando mixagem com {len(segments_data)} segmentos, ambiente={ambient_cfg.get('enabled')}")
+
     try:
         # 1. Cria arquivos temporários para cada segmento (fala e efeitos)
-        for data in segments_data:
+        for idx, data in enumerate(segments_data):
             if 'pcm_bytes' in data:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
@@ -412,6 +416,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
                     wav_file.setframerate(data['sample_rate'])
                     wav_file.writeframes(data['pcm_bytes'])
                 temp_files.append(wav_path)
+                logger.debug(f"Segmento {idx}: PCM -> {wav_path} ({len(data['pcm_bytes'])} bytes)")
 
             elif 'effect' in data:
                 voice_dir = VOICES_DIR / data['voice']
@@ -421,6 +426,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
                 if not effect_path.exists():
                     raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
                 temp_files.append(str(effect_path))
+                logger.debug(f"Segmento {idx}: Efeito '{data['effect']}' -> {effect_path}")
             else:
                 continue
 
@@ -442,6 +448,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
                 ambient_nframes = wf.getnframes()
             temp_files.append(str(ambient_path))
             ambient_file = str(ambient_path)
+            logger.debug(f"Ambiente: {ambient_path} ({ambient_nframes} frames, ganho {volume_db}dB)")
 
         # 3. Monta comando FFmpeg
         for f in temp_files:
@@ -459,14 +466,15 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
         else:
             inputs = "".join(f"[{i}:a]" for i in range(num_segments))
             concat_filter = f"{inputs}concat=n={num_segments}:v=0:a=1[conca]"
+        logger.debug(f"Concatenação de {num_segments} segmentos")
 
         if ambient_file:
             ambient_idx = num_segments
             size = ambient_nframes
-            # APLICA O GANHO (volume_db) E DEPOIS LOOP INFINITO
             loop_filter = f"[{ambient_idx}:a]volume={volume_db}dB,aloop=loop=-1:size={size}[amb_loop]"
             mix_filter = "[conca][amb_loop]amix=inputs=2:duration=longest[out]"
             filters = [concat_filter, loop_filter, mix_filter]
+            logger.debug(f"Ambiente em loop com ganho {volume_db}dB")
         else:
             filters = [concat_filter + "[out]"]
 
@@ -481,9 +489,12 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
             "pipe:1"
         ])
 
+        logger.debug(f"Comando FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")  # mostra só o início
+
         # 5. Executa
         result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=15)
         wav_bytes = result.stdout
+        logger.debug(f"FFmpeg concluído: {len(wav_bytes)} bytes de saída")
 
         t_total = time.perf_counter() - t0
 
@@ -505,10 +516,11 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
             try:
                 if os.path.exists(f):
                     os.unlink(f)
+                    logger.debug(f"Removido arquivo temporário: {f}")
             except:
                 pass
 
-# ---------- Processamento TTS ----------
+# ---------- Processamento TTS (CORRIGIDO: efeitos com colchetes removidos) ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -521,6 +533,8 @@ def process_tts_only(
 ) -> Tuple[List[Dict], Dict[str, float]]:
     t_worker_start = time.perf_counter()
     queue_wait = t_worker_start - enqueue_time
+
+    logger.debug(f"process_tts_only iniciado após {queue_wait:.3f}s de fila")
 
     is_dialog = bool(speakers)
     if not is_dialog:
@@ -538,23 +552,33 @@ def process_tts_only(
 
     parts = re.split(r'(\[.*?\])', text)
     parts = [p.strip() for p in parts if p.strip()]
+    logger.debug(f"Texto dividido em {len(parts)} partes: {parts}")
 
     segments = []
     synth_time_total = 0.0
 
-    for part in parts:
+    for idx, part in enumerate(parts):
+        logger.debug(f"Processando parte {idx}: '{part}'")
+
+        # 1. Verifica se é uma tag de speaker (apenas modo diálogo)
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
+                logger.debug(f"Speaker trocado para: {current_role}")
             continue
 
-        if part in effects:
-            effect_file = effects[part]
+        # 2. CORREÇÃO: Remove colchetes para comparar com as chaves do dicionário 'effects'
+        #    Ex: "[tosse]" -> "tosse"
+        effect_key = part[1:-1] if part.startswith('[') and part.endswith(']') else part
+        if effect_key in effects:
+            effect_file = effects[effect_key]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
+            logger.debug(f"Efeito detectado: '{effect_key}' -> '{effect_file}' (voz: {voice_for_eff})")
             continue
 
+        # 3. Senão, é texto para síntese
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -569,8 +593,10 @@ def process_tts_only(
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
+        logger.debug(f"Síntese da parte '{part[:30]}...' concluída em {time.perf_counter()-t_synth_start:.3f}s")
 
     total_worker_time = time.perf_counter() - t_worker_start
+    logger.debug(f"process_tts_only concluído em {total_worker_time:.3f}s, {len(segments)} segmentos")
 
     try:
         cpu_id = os.sched_getaffinity(0)
@@ -641,6 +667,7 @@ def json_response(data: Any, status_code: int = 200) -> JSONResponse:
 async def synthesize(req: TTSRequest):
     if request_semaphore:
         await request_semaphore.acquire()
+        logger.debug(f"Semáforo adquirido (concorrência atual: {request_semaphore._value})")
     try:
         t_total_start = time.perf_counter()
 
@@ -660,6 +687,8 @@ async def synthesize(req: TTSRequest):
         except AttributeError:
             ambient_dict = req.ambient.dict()
 
+        logger.debug(f"Requisição: text='{req.text[:50]}...', effects={req.effects}, ambient={ambient_dict.get('enabled')}")
+
         enqueue_time = time.perf_counter()
         loop = asyncio.get_running_loop()
 
@@ -677,6 +706,7 @@ async def synthesize(req: TTSRequest):
             enqueue_time
         )
         segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
+        logger.debug(f"TTS concluído: {len(segments)} segmentos")
 
         # 2. Mixagem
         mix_future = loop.run_in_executor(
@@ -687,6 +717,7 @@ async def synthesize(req: TTSRequest):
             TARGET_SAMPLE_RATE
         )
         wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
+        logger.debug(f"Mixagem concluída: {len(wav_bytes)} bytes")
 
         total_time = time.perf_counter() - t_total_start
         metrics = {
@@ -718,6 +749,7 @@ async def synthesize(req: TTSRequest):
     finally:
         if request_semaphore:
             request_semaphore.release()
+            logger.debug("Semáforo liberado")
 
 # ---------- Endpoints de diagnóstico ----------
 @app.get("/stats")
