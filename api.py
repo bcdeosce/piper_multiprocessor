@@ -50,13 +50,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------- Configuração de logs (nível DEBUG para diagnóstico) ----------
+# ---------- Configuração de logs ----------
 logging.basicConfig(
-    level=logging.DEBUG,  # Mudado para DEBUG para capturar detalhes
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
-# Ajusta nível do ONNX para não poluir
+logger.setLevel(logging.DEBUG)  # Ativa DEBUG para ver todos os logs
+
 ort.set_default_logger_severity(3)
 
 BASE_DIR = Path("/app")
@@ -67,62 +68,6 @@ EFFECTS_DIR = BASE_DIR / "effects"
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
-
-TARGET_SAMPLE_RATE = 22050
-TARGET_CHANNELS = 1
-TARGET_SAMPLE_WIDTH = 2  # 16 bits
-
-# ---------- FUNÇÃO PARA CONVERTER TODOS OS ÁUDIOS NO INÍCIO ----------
-def convert_audio_to_target(file_path: Path) -> bool:
-    """Converte um arquivo de áudio para o formato alvo (22050Hz, mono, 16-bit PCM)."""
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(file_path),
-            "-ar", str(TARGET_SAMPLE_RATE),
-            "-ac", str(TARGET_CHANNELS),
-            "-sample_fmt", "s16",
-            "-c:a", "pcm_s16le",
-            str(file_path) + ".tmp"
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        os.replace(str(file_path) + ".tmp", str(file_path))
-        logger.debug(f"Áudio convertido: {file_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao converter {file_path}: {e}")
-        return False
-
-def convert_all_audio_files():
-    """Varre os diretórios e converte todos os .wav para o formato padrão."""
-    logger.info("Convertendo todos os arquivos de áudio para o formato padrão...")
-    converted = 0
-    errors = 0
-
-    for wav in AMBIENT_DIR.glob("*.wav"):
-        if convert_audio_to_target(wav):
-            converted += 1
-        else:
-            errors += 1
-
-    for wav in EFFECTS_DIR.glob("*.wav"):
-        if convert_audio_to_target(wav):
-            converted += 1
-        else:
-            errors += 1
-
-    for voice_dir in VOICES_DIR.iterdir():
-        if voice_dir.is_dir():
-            for wav in voice_dir.glob("*.wav"):
-                if convert_audio_to_target(wav):
-                    converted += 1
-                else:
-                    errors += 1
-
-    logger.info(f"Conversão concluída: {converted} arquivos convertidos, {errors} erros.")
-
-# Executa a conversão antes de qualquer outra operação
-convert_all_audio_files()
 
 # ---------- Detecção de núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
@@ -391,21 +336,36 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
         chunk_generator = voice.synthesize(text, syn_config=config)
         audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
         sample_rate = voice.config.sample_rate
-        logger.debug(f"Síntese de '{text[:30]}...' OK: {len(audio_bytes)} bytes, {sample_rate}Hz")
         return sample_rate, audio_bytes
     finally:
         pool.put(voice)
 
-# ---------- FUNÇÃO DE MIXAGEM (concat + ambiente em loop com ganho) ----------
-def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RATE):
+# ---------- MIXAGEM E CONCATENAÇÃO CORRIGIDA COM LOGS ----------
+def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+    """
+    Concatena áudios em sequência (voz + efeitos) e sobrepõe ambiente ao fundo.
+    Com logs detalhados para depuração.
+    """
     t0 = time.perf_counter()
+    logger.info("=" * 60)
+    logger.info("🔊 INÍCIO DA MIXAGEM/CONCATENAÇÃO")
+    logger.info(f"📦 Recebidos {len(segments_data)} segmentos")
+
+    # --- 1. LOG: ORDEM DOS SEGMENTOS ---
+    logger.info("📋 Ordem dos segmentos:")
+    for i, data in enumerate(segments_data):
+        if 'pcm_bytes' in data:
+            size_kb = len(data['pcm_bytes']) / 1024
+            logger.info(f"  [{i}] VOZ   | sample_rate={data['sample_rate']} | tamanho={size_kb:.1f}KB")
+        elif 'effect' in data:
+            logger.info(f"  [{i}] EFEITO | arquivo='{data['effect']}' | voz='{data['voice']}'")
+        else:
+            logger.info(f"  [{i}] DESCONHECIDO | {data}")
+
     temp_files = []
-    ffmpeg_cmd = ["ffmpeg", "-y"]
-
-    logger.debug(f"Iniciando mixagem com {len(segments_data)} segmentos, ambiente={ambient_cfg.get('enabled')}")
-
     try:
-        # 1. Cria arquivos temporários para cada segmento (fala e efeitos)
+        # --- 2. CRIAÇÃO DOS ARQUIVOS TEMPORÁRIOS ---
+        logger.info("📁 Criando arquivos temporários...")
         for idx, data in enumerate(segments_data):
             if 'pcm_bytes' in data:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -416,7 +376,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
                     wav_file.setframerate(data['sample_rate'])
                     wav_file.writeframes(data['pcm_bytes'])
                 temp_files.append(wav_path)
-                logger.debug(f"Segmento {idx}: PCM -> {wav_path} ({len(data['pcm_bytes'])} bytes)")
+                logger.info(f"  [{idx}] WAV criado: {wav_path} (PCM, {data['sample_rate']}Hz, {len(data['pcm_bytes'])/1024:.1f}KB)")
 
             elif 'effect' in data:
                 voice_dir = VOICES_DIR / data['voice']
@@ -424,103 +384,153 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RA
                 if not effect_path.exists():
                     effect_path = EFFECTS_DIR / data['effect']
                 if not effect_path.exists():
-                    raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
-                temp_files.append(str(effect_path))
-                logger.debug(f"Segmento {idx}: Efeito '{data['effect']}' -> {effect_path}")
+                    logger.error(f"  [{idx}] Efeito '{data['effect']}' não encontrado")
+                    continue
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    with open(effect_path, 'rb') as src:
+                        f.write(src.read())
+                    temp_files.append(f.name)
+                logger.info(f"  [{idx}] WAV copiado: {f.name} (efeito '{data['effect']}', {effect_path.stat().st_size/1024:.1f}KB)")
             else:
-                continue
+                logger.warning(f"  [{idx}] Ignorado: dados desconhecidos")
+
+        # --- 3. ADICIONAR AMBIENTE (se habilitado) ---
+        ambient_added = False
+        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
+            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
+            if ambient_path.exists():
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    with open(ambient_path, 'rb') as src:
+                        f.write(src.read())
+                    temp_files.append(f.name)
+                    ambient_added = True
+                logger.info(f"🌧️ Ambiente adicionado: {f.name} (arquivo '{ambient_cfg['file']}.wav', {ambient_path.stat().st_size/1024:.1f}KB)")
+            else:
+                logger.warning(f"🌧️ Arquivo de ambiente '{ambient_cfg['file']}.wav' não encontrado")
 
         if not temp_files:
-            raise ValueError("Nenhum segmento para processar")
+            raise ValueError("Nenhum arquivo para processar")
 
-        # 2. Adiciona ambiente (se habilitado)
-        ambient_enabled = ambient_cfg.get('enabled', False) and ambient_cfg.get('file')
-        ambient_file = None
-        ambient_nframes = 0
-        volume_db = ambient_cfg.get('volume_db', -15.0)
+        # --- 4. PROCESSAMENTO ---
+        logger.info("🔧 Montando comando FFmpeg...")
+        num_segments = len(temp_files)
+        logger.info(f"📊 Total de arquivos de entrada: {num_segments}")
 
-        if ambient_enabled:
-            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if not ambient_path.exists():
-                raise FileNotFoundError(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado")
+        if ambient_added:
+            # Separa o ambiente do resto
+            ambient_file = temp_files[-1]
+            voice_files = temp_files[:-1]
 
-            with wave.open(str(ambient_path), 'rb') as wf:
-                ambient_nframes = wf.getnframes()
-            temp_files.append(str(ambient_path))
-            ambient_file = str(ambient_path)
-            logger.debug(f"Ambiente: {ambient_path} ({ambient_nframes} frames, ganho {volume_db}dB)")
+            # Passo 1: Concatena os segmentos de voz/efeitos
+            filter_concat = f"concat=n={len(voice_files)}:v=0:a=1"
+            concat_cmd = ["ffmpeg", "-y"]
+            for f in voice_files:
+                concat_cmd.extend(["-i", f])
+            concat_cmd.extend([
+                "-filter_complex", filter_concat,
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ])
 
-        # 3. Monta comando FFmpeg
-        for f in temp_files:
-            ffmpeg_cmd.extend(["-i", f])
+            logger.info(f"🔗 Comando de concatenação (voz + efeitos):")
+            logger.info(f"  {' '.join(concat_cmd)}")
 
-        # 4. Constrói filtros
-        filters = []
-        if ambient_file:
-            num_segments = len(temp_files) - 1
+            logger.info("⏳ Executando concatenação dos segmentos...")
+            t_concat_start = time.perf_counter()
+            result_concat = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
+            t_concat = time.perf_counter() - t_concat_start
+            main_audio_bytes = result_concat.stdout
+            logger.info(f"✅ Concatenação concluída em {t_concat:.3f}s | tamanho={len(main_audio_bytes)/1024:.1f}KB")
+
+            # Passo 2: Mixa o ambiente sobre o áudio principal
+            logger.info("🔀 Sobrepondo ambiente sobre o áudio principal...")
+
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
+                f_main.write(main_audio_bytes)
+                main_file = f_main.name
+
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb:
+                with open(ambient_file, 'rb') as src:
+                    f_amb.write(src.read())
+                amb_file = f_amb.name
+
+            mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", main_file,
+                "-i", amb_file,
+                "-filter_complex", "amix=inputs=2:duration=longest",
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ]
+
+            logger.info(f"🔀 Comando de mixagem (ambiente):")
+            logger.info(f"  {' '.join(mix_cmd)}")
+
+            logger.info("⏳ Executando mixagem...")
+            t_mix_start = time.perf_counter()
+            result_mix = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
+            t_mix = time.perf_counter() - t_mix_start
+            wav_bytes = result_mix.stdout
+            logger.info(f"✅ Mixagem concluída em {t_mix:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
+
+            # Limpa temporários da mixagem
+            for f in [main_file, amb_file]:
+                try:
+                    os.unlink(f)
+                except:
+                    pass
+
         else:
-            num_segments = len(temp_files)
+            # Sem ambiente: apenas concatenação simples
+            filter_concat = f"concat=n={num_segments}:v=0:a=1"
+            concat_cmd = ["ffmpeg", "-y"]
+            for f in temp_files:
+                concat_cmd.extend(["-i", f])
+            concat_cmd.extend([
+                "-filter_complex", filter_concat,
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ])
 
-        if num_segments == 1:
-            concat_filter = f"[0:a]"
-        else:
-            inputs = "".join(f"[{i}:a]" for i in range(num_segments))
-            concat_filter = f"{inputs}concat=n={num_segments}:v=0:a=1[conca]"
-        logger.debug(f"Concatenação de {num_segments} segmentos")
+            logger.info(f"🔗 Comando de concatenação (sem ambiente):")
+            logger.info(f"  {' '.join(concat_cmd)}")
 
-        if ambient_file:
-            ambient_idx = num_segments
-            size = ambient_nframes
-            loop_filter = f"[{ambient_idx}:a]volume={volume_db}dB,aloop=loop=-1:size={size}[amb_loop]"
-            mix_filter = "[conca][amb_loop]amix=inputs=2:duration=longest[out]"
-            filters = [concat_filter, loop_filter, mix_filter]
-            logger.debug(f"Ambiente em loop com ganho {volume_db}dB")
-        else:
-            filters = [concat_filter + "[out]"]
+            logger.info("⏳ Executando concatenação...")
+            t_concat_start = time.perf_counter()
+            result = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
+            t_concat = time.perf_counter() - t_concat_start
+            wav_bytes = result.stdout
+            logger.info(f"✅ Concatenação concluída em {t_concat:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
 
-        filter_complex = "; ".join(filters)
-        ffmpeg_cmd.extend(["-filter_complex", filter_complex])
-        ffmpeg_cmd.extend([
-            "-map", "[out]",
-            "-ar", str(target_rate),
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            "-f", "wav",
-            "pipe:1"
-        ])
-
-        logger.debug(f"Comando FFmpeg: {' '.join(ffmpeg_cmd[:10])}...")  # mostra só o início
-
-        # 5. Executa
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=15)
-        wav_bytes = result.stdout
-        logger.debug(f"FFmpeg concluído: {len(wav_bytes)} bytes de saída")
-
+        # --- 5. LOG FINAL ---
         t_total = time.perf_counter() - t0
-
-        # Atualiza estatísticas do worker de mixagem
-        try:
-            cpu_id = os.sched_getaffinity(0)
-            cpu_id = next(iter(cpu_id))
-            update_worker_stats("mix", cpu_id, t_total)
-        except:
-            pass
+        logger.info(f"🎯 MIXAGEM/CONCATENAÇÃO FINALIZADA em {t_total:.3f}s")
+        logger.info(f"📦 Tamanho final do áudio: {len(wav_bytes)/1024:.1f}KB")
+        logger.info("=" * 60)
 
         return wav_bytes, t_total
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg erro: {e.stderr.decode()}")
-        raise RuntimeError("Falha na mixagem com FFmpeg")
+        logger.error(f"❌ FFmpeg ERRO: {e.stderr.decode()}")
+        logger.error(f"   Comando: {' '.join(e.cmd)}")
+        raise RuntimeError("Falha na mixagem/concatenação com FFmpeg")
     finally:
         for f in temp_files:
             try:
-                if os.path.exists(f):
-                    os.unlink(f)
-                    logger.debug(f"Removido arquivo temporário: {f}")
+                os.unlink(f)
             except:
                 pass
 
-# ---------- Processamento TTS (CORRIGIDO: efeitos com colchetes removidos) ----------
+# ---------- Processamento TTS ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -533,8 +543,6 @@ def process_tts_only(
 ) -> Tuple[List[Dict], Dict[str, float]]:
     t_worker_start = time.perf_counter()
     queue_wait = t_worker_start - enqueue_time
-
-    logger.debug(f"process_tts_only iniciado após {queue_wait:.3f}s de fila")
 
     is_dialog = bool(speakers)
     if not is_dialog:
@@ -552,33 +560,23 @@ def process_tts_only(
 
     parts = re.split(r'(\[.*?\])', text)
     parts = [p.strip() for p in parts if p.strip()]
-    logger.debug(f"Texto dividido em {len(parts)} partes: {parts}")
 
     segments = []
     synth_time_total = 0.0
 
-    for idx, part in enumerate(parts):
-        logger.debug(f"Processando parte {idx}: '{part}'")
-
-        # 1. Verifica se é uma tag de speaker (apenas modo diálogo)
+    for part in parts:
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
-                logger.debug(f"Speaker trocado para: {current_role}")
             continue
 
-        # 2. CORREÇÃO: Remove colchetes para comparar com as chaves do dicionário 'effects'
-        #    Ex: "[tosse]" -> "tosse"
-        effect_key = part[1:-1] if part.startswith('[') and part.endswith(']') else part
-        if effect_key in effects:
-            effect_file = effects[effect_key]
+        if part in effects:
+            effect_file = effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
-            logger.debug(f"Efeito detectado: '{effect_key}' -> '{effect_file}' (voz: {voice_for_eff})")
             continue
 
-        # 3. Senão, é texto para síntese
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -593,10 +591,8 @@ def process_tts_only(
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
-        logger.debug(f"Síntese da parte '{part[:30]}...' concluída em {time.perf_counter()-t_synth_start:.3f}s")
 
     total_worker_time = time.perf_counter() - t_worker_start
-    logger.debug(f"process_tts_only concluído em {total_worker_time:.3f}s, {len(segments)} segmentos")
 
     try:
         cpu_id = os.sched_getaffinity(0)
@@ -650,7 +646,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Concat + Ambiente Loop com Ganho)")
+app = FastAPI(title="Piper TTS API (Concat + Mix com Debug)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
@@ -667,7 +663,6 @@ def json_response(data: Any, status_code: int = 200) -> JSONResponse:
 async def synthesize(req: TTSRequest):
     if request_semaphore:
         await request_semaphore.acquire()
-        logger.debug(f"Semáforo adquirido (concorrência atual: {request_semaphore._value})")
     try:
         t_total_start = time.perf_counter()
 
@@ -687,12 +682,9 @@ async def synthesize(req: TTSRequest):
         except AttributeError:
             ambient_dict = req.ambient.dict()
 
-        logger.debug(f"Requisição: text='{req.text[:50]}...', effects={req.effects}, ambient={ambient_dict.get('enabled')}")
-
         enqueue_time = time.perf_counter()
         loop = asyncio.get_running_loop()
 
-        # 1. TTS
         tts_future = loop.run_in_executor(
             tts_pool,
             process_tts_only,
@@ -706,18 +698,15 @@ async def synthesize(req: TTSRequest):
             enqueue_time
         )
         segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
-        logger.debug(f"TTS concluído: {len(segments)} segmentos")
 
-        # 2. Mixagem
         mix_future = loop.run_in_executor(
             mix_pool,
             mix_and_export_task,
             segments,
             ambient_dict,
-            TARGET_SAMPLE_RATE
+            22050
         )
         wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
-        logger.debug(f"Mixagem concluída: {len(wav_bytes)} bytes")
 
         total_time = time.perf_counter() - t_total_start
         metrics = {
@@ -749,7 +738,6 @@ async def synthesize(req: TTSRequest):
     finally:
         if request_semaphore:
             request_semaphore.release()
-            logger.debug("Semáforo liberado")
 
 # ---------- Endpoints de diagnóstico ----------
 @app.get("/stats")
