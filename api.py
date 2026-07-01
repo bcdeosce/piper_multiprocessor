@@ -50,13 +50,36 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------- Configuração de logs ----------
+# ---------- Configuração de logs com buffer em memória ----------
+class MemoryHandler(logging.Handler):
+    """Guarda as últimas N mensagens de log em memória (apenas WARNING+)."""
+    def __init__(self, capacity=100):
+        super().__init__()
+        self.capacity = capacity
+        self.buffer = []
+
+    def emit(self, record):
+        self.buffer.append(self.format(record))
+        if len(self.buffer) > self.capacity:
+            self.buffer.pop(0)
+
+memory_handler = MemoryHandler(capacity=100)
+memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+
+# Configura o logger
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        memory_handler
+    ]
 )
 logger = logging.getLogger("piper-api")
 logger.setLevel(logging.INFO)
+
+# Ajusta o nível do handler de memória para WARNING+
+memory_handler.setLevel(logging.WARNING)
 
 ort.set_default_logger_severity(3)
 
@@ -64,10 +87,12 @@ BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
 EFFECTS_DIR = BASE_DIR / "effects"
+BENCH_DIR = BASE_DIR / "bench"
 
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
+BENCH_DIR.mkdir(exist_ok=True)
 
 # ---------- Detecção de núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
@@ -156,13 +181,18 @@ logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 # ---------- GERENCIADOR COMPARTILHADO ----------
 manager = mp.Manager()
 
-# Estatísticas dos workers
+# Estatísticas dos workers (por processo)
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
 
-# Estatísticas agregadas
-stats = manager.dict()
-stats_lock = mp.Lock()
+# Estatísticas agregadas para /bench e /stats
+bench_stats = {
+    "total": manager.list(),
+    "tts_wall": manager.list(),
+    "mix": manager.list(),
+    "queue_wait": manager.list(),
+}
+bench_stats_lock = mp.Lock()
 
 def register_worker(worker_type, worker_id, pid, cpu_id, is_physical):
     with worker_stats_lock:
@@ -185,15 +215,18 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["total_time"] += request_time
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
-        else:
-            logger.warning(f"Worker {key} não encontrado para atualização")
 
-def update_stats(metric_name, value):
-    """Atualiza as estatísticas agregadas no dicionário compartilhado."""
-    with stats_lock:
-        if metric_name not in stats:
-            stats[metric_name] = []
-        stats[metric_name].append(value)
+def compute_stats(values: list) -> dict:
+    if not values:
+        return {"mean": 0, "min": 0, "max": 0, "p95": 0, "count": 0}
+    arr = np.array(values)
+    return {
+        "mean": float(np.mean(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "p95": float(np.percentile(arr, 95)),
+        "count": len(values),
+    }
 
 # ---------- Inicializador TTS ----------
 def _init_tts_worker():
@@ -367,7 +400,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- MIXAGEM COM MÉTRICAS DETALHADAS E VOLUME CORRIGIDO ----------
+# ---------- MIXAGEM COM MÉTRICAS DETALHADAS ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     metrics = {}
     t0_total = time.perf_counter()
@@ -432,7 +465,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     ambient_frames = wf.getnframes()
                     ambient_rate = wf.getframerate()
                     ambient_original_duration = ambient_frames / ambient_rate
-                logger.info(f"🌧️ Ambiente '{ambient_cfg['file']}.wav' duração original: {ambient_original_duration:.2f}s, volume solicitado: {ambient_volume_db}dB")
+                logger.info(f"🌧️ Ambiente '{ambient_cfg['file']}.wav' duração original: {ambient_original_duration:.2f}s, volume: {ambient_volume_db}dB")
 
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     with open(ambient_path, 'rb') as src:
@@ -483,30 +516,25 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         # --- SE HOUVER AMBIENTE, FAZ O LOOP E MIXA ---
         if ambient_added and ambient_file:
-            # Calcula quantas repetições do ambiente são necessárias
             if ambient_original_duration > 0:
                 repeat_times = int(main_duration // ambient_original_duration) + 1
             else:
                 repeat_times = 1
 
-            logger.info(f"🔄 Ambiente original: {ambient_original_duration:.2f}s, precisamos cobrir {main_duration:.2f}s")
-            logger.info(f"🔄 Ambiente será repetido {repeat_times} vezes")
+            logger.info(f"🔄 Ambiente original: {ambient_original_duration:.2f}s, cobrir {main_duration:.2f}s, repetir {repeat_times}x")
 
-            # Cria o ambiente estendido (loop)
             loop_cmd = ["ffmpeg", "-y", "-stream_loop", str(repeat_times), "-i", ambient_file,
                        "-c", "copy", "-f", "wav", "pipe:1"]
-            logger.info(f"🔄 Comando de loop do ambiente:")
-            logger.info(f"  {' '.join(loop_cmd)}")
+            logger.info(f"🔄 Loop ambiente: {' '.join(loop_cmd)}")
             t0 = time.perf_counter()
             result_loop = subprocess.run(loop_cmd, capture_output=True, check=True, timeout=10)
             metrics['ambient_loop_time'] = time.perf_counter() - t0
             looped_ambient_bytes = result_loop.stdout
             looped_duration = len(looped_ambient_bytes) / (target_rate * 2)
-            logger.info(f"✅ Loop do ambiente concluído em {metrics['ambient_loop_time']:.3f}s | duração={looped_duration:.2f}s | tamanho={len(looped_ambient_bytes)/1024:.1f}KB")
+            logger.info(f"✅ Loop em {metrics['ambient_loop_time']:.3f}s | duração={looped_duration:.2f}s")
 
-            # Corta o ambiente para a duração exata do diálogo
             if looped_duration > main_duration:
-                logger.info(f"✂️ Ambiente estendido ({looped_duration:.2f}s) é maior que o diálogo ({main_duration:.2f}s). Cortando...")
+                logger.info(f"✂️ Cortando ambiente de {looped_duration:.2f}s para {main_duration:.2f}s")
                 trim_cmd = [
                     "ffmpeg", "-y",
                     "-i", "pipe:0",
@@ -522,22 +550,18 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 metrics['ambient_trim_time'] = time.perf_counter() - t0
                 looped_ambient_bytes = result_trim.stdout
                 looped_duration = len(looped_ambient_bytes) / (target_rate * 2)
-                logger.info(f"✅ Corte concluído em {metrics['ambient_trim_time']:.3f}s | ambiente agora tem {looped_duration:.2f}s")
+                logger.info(f"✅ Corte em {metrics['ambient_trim_time']:.3f}s | agora {looped_duration:.2f}s")
             else:
                 metrics['ambient_trim_time'] = 0.0
 
-            # Salva o ambiente final
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb_loop:
                 f_amb_loop.write(looped_ambient_bytes)
                 looped_ambient_file = f_amb_loop.name
-            logger.info(f"📁 Ambiente final salvo em: {looped_ambient_file}")
 
-            # Salva o áudio principal
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
                 f_main.write(main_audio_bytes)
                 main_file = f_main.name
 
-            # CORREÇÃO DO VOLUME: aplica ganho e evita renormalização do amix
             volume_filter = f"volume={ambient_volume_db}dB"
             mix_cmd = [
                 "ffmpeg", "-y",
@@ -551,23 +575,17 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 "pipe:1"
             ]
 
-            logger.info(f"🔀 Comando de mixagem (ambiente com volume {ambient_volume_db}dB, normalize=0):")
-            logger.info(f"  {' '.join(mix_cmd)}")
-
+            logger.info(f"🔀 Mixagem: {' '.join(mix_cmd)}")
             t0 = time.perf_counter()
-            logger.info("⏳ Executando mixagem...")
             result_mix = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
             metrics['amix_time'] = time.perf_counter() - t0
             wav_bytes = result_mix.stdout
-            logger.info(f"✅ Mixagem concluída em {metrics['amix_time']:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
+            logger.info(f"✅ Mixagem em {metrics['amix_time']:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
 
-            # Limpeza dos arquivos extras
             t0 = time.perf_counter()
             for f in [main_file, looped_ambient_file]:
-                try:
-                    os.unlink(f)
-                except:
-                    pass
+                try: os.unlink(f)
+                except: pass
             metrics['cleanup_time'] = time.perf_counter() - t0
 
         else:
@@ -579,30 +597,27 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         metrics['total_mix_time'] = time.perf_counter() - t0_total
 
-        # Atualiza estatísticas do worker de mixagem (CORRIGIDO: try/except para evitar NameError)
+        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
             update_worker_stats("mix", cpu_id, metrics['total_mix_time'])
         except Exception as e:
-            logger.warning(f"Não foi possível atualizar stats do mix: {e}")
+            logger.warning(f"Mix stats: {e}")
 
-        logger.info(f"🎯 MIXAGEM/CONCATENAÇÃO FINALIZADA em {metrics['total_mix_time']:.3f}s")
-        logger.info(f"📦 Tamanho final do áudio: {len(wav_bytes)/1024:.1f}KB")
+        logger.info(f"🎯 MIXAGEM FINALIZADA em {metrics['total_mix_time']:.3f}s | tamanho final {len(wav_bytes)/1024:.1f}KB")
         logger.info("=" * 60)
 
         return wav_bytes, metrics
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ FFmpeg ERRO: {e.stderr.decode()}")
+        logger.error(f"❌ FFmpeg erro: {e.stderr.decode()}")
         logger.error(f"   Comando: {' '.join(e.cmd)}")
-        raise RuntimeError("Falha na mixagem/concatenação com FFmpeg")
+        raise RuntimeError("Falha na mixagem com FFmpeg")
     finally:
         for f in temp_files:
-            try:
-                os.unlink(f)
-            except:
-                pass
+            try: os.unlink(f)
+            except: pass
 
 # ---------- Processamento TTS ----------
 def process_tts_only(
@@ -621,7 +636,7 @@ def process_tts_only(
     is_dialog = bool(speakers)
     if not is_dialog:
         if not voice_name:
-            raise ValueError("voice_name é obrigatório no modo simples")
+            raise ValueError("voice_name obrigatório no modo simples")
         speaker_map = {None: (voice_name, speed, noise_scale, noise_w_scale)}
         current_role = None
     else:
@@ -635,31 +650,31 @@ def process_tts_only(
     parts = re.split(r'(\[.*?\])', text)
     parts = [p.strip() for p in parts if p.strip()]
 
-    logger.info(f"📋 Partes divididas: {parts}")
+    logger.info(f"📋 Partes: {parts}")
 
     segments = []
     synth_time_total = 0.0
 
     for part in parts:
-        logger.debug(f"🔍 Processando parte: '{part}'")
+        logger.debug(f"🔍 '{part}'")
 
-        # --- 1. EFEITO (ANTES DE TAG) ---
+        # 1. EFEITO (ANTES DE TAG)
         if part in effects:
             effect_file = effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
-            logger.info(f"🎬 Efeito adicionado: '{part}' -> '{effect_file}' (voz: {voice_for_eff})")
+            logger.info(f"🎬 Efeito: '{part}' -> '{effect_file}'")
             continue
 
-        # --- 2. TAG DE SPEAKER ---
+        # 2. TAG DE SPEAKER
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
                 current_role = role
-                logger.info(f"🔄 Speaker trocado para: {current_role}")
+                logger.info(f"🔄 Speaker: {current_role}")
             continue
 
-        # --- 3. SÍNTESE ---
+        # 3. SÍNTESE
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -675,7 +690,7 @@ def process_tts_only(
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
-        logger.info(f"✅ Áudio gerado: sample_rate={sample_rate}, tamanho={len(pcm_bytes)/1024:.1f}KB")
+        logger.info(f"✅ Áudio: sample_rate={sample_rate}, tamanho={len(pcm_bytes)/1024:.1f}KB")
 
     total_worker_time = time.perf_counter() - t_worker_start
 
@@ -765,19 +780,12 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (Warm-up + Métricas)")
+app = FastAPI(title="Piper TTS API (CPU)")
 
 warmup_complete = False
 warmup_lock = asyncio.Lock()
 
-def json_response(data: Any, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(
-        content=data,
-        status_code=status_code,
-        media_type="application/json"
-    )
-
-# ---------- Evento de startup com warm-up ----------
+# ---------- Evento de startup ----------
 @app.on_event("startup")
 async def startup():
     global warmup_complete
@@ -786,15 +794,15 @@ async def startup():
     await loop.run_in_executor(None, warmup_workers, tts_pool)
     async with warmup_lock:
         warmup_complete = True
-    logger.info("✅ Servidor pronto para receber requisições.")
+    logger.info("✅ Servidor pronto.")
 
 # ---------- Endpoint principal ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     async with warmup_lock:
         if not warmup_complete:
-            raise HTTPException(503, "Servidor ainda está carregando modelos. Tente novamente em alguns segundos.")
-    
+            raise HTTPException(503, "Carregando modelos. Tente novamente.")
+
     if request_semaphore:
         await request_semaphore.acquire()
     try:
@@ -843,30 +851,18 @@ async def synthesize(req: TTSRequest):
         wav_bytes, mix_metrics = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
 
         total_time = time.perf_counter() - t_total_start
-        metrics = {
-            'total': total_time,
-            'queue_wait': tts_metrics['queue_wait'],
-            'synth_time': tts_metrics['synth_time'],
-            'mix_time': mix_metrics['total_mix_time'],
-            'total_worker_time': tts_metrics['tts_worker_time'] + mix_metrics['total_mix_time'],
-            'num_segments': tts_metrics['num_segments'],
-            'tts_worker_time': tts_metrics['tts_worker_time'],
-            'mix_temp_files_creation': mix_metrics['temp_files_creation'],
-            'mix_concat_time': mix_metrics['concat_time'],
-            'mix_ambient_loop_time': mix_metrics['ambient_loop_time'],
-            'mix_ambient_trim_time': mix_metrics['ambient_trim_time'],
-            'mix_amix_time': mix_metrics['amix_time'],
-            'mix_cleanup_time': mix_metrics['cleanup_time'],
-        }
 
-        for key, value in metrics.items():
-            update_stats(key, value)
+        # Atualiza estatísticas para /bench e /stats
+        with bench_stats_lock:
+            bench_stats["total"].append(total_time)
+            bench_stats["tts_wall"].append(tts_metrics['tts_worker_time'])
+            bench_stats["mix"].append(mix_metrics['total_mix_time'])
+            bench_stats["queue_wait"].append(tts_metrics['queue_wait'])
 
         logger.info(
             f"⏱️ Requisição: total={total_time:.3f}s | "
-            f"fila={metrics['queue_wait']:.3f}s | synth={metrics['synth_time']:.3f}s | "
-            f"mix_total={metrics['mix_time']:.3f}s | tts_worker={metrics['tts_worker_time']:.3f}s | "
-            f"segmentos={metrics['num_segments']}"
+            f"fila={tts_metrics['queue_wait']:.3f}s | synth={tts_metrics['synth_time']:.3f}s | "
+            f"mix={mix_metrics['total_mix_time']:.3f}s | segmentos={tts_metrics['num_segments']}"
         )
 
         return Response(content=wav_bytes, media_type="audio/wav")
@@ -874,33 +870,66 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
-# ---------- Endpoints de diagnóstico ----------
+# ---------- ENDPOINTS DE DIAGNÓSTICO ----------
+
+# 1. BENCH
+@app.get("/bench")
+async def get_bench():
+    with bench_stats_lock:
+        total = compute_stats(list(bench_stats["total"]))
+        tts = compute_stats(list(bench_stats["tts_wall"]))
+        mix = compute_stats(list(bench_stats["mix"]))
+        queue = compute_stats(list(bench_stats["queue_wait"]))
+    return Response(
+        content=json.dumps({
+            "benchmark_results": {
+                "total": total,
+                "tts_wall": tts,
+                "mix": mix,
+                "queue_wait": queue
+            },
+            "configuration": {
+                "voices": list(VOICE_PATHS.keys()),
+                "tts_workers": TTS_WORKERS,
+                "mix_workers": MIX_WORKERS,
+                "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+                "request_timeout": REQUEST_TIMEOUT,
+                "physical_cores": PHYSICAL_CORES,
+                "hyper_thread_cores": HYPER_THREAD_CORES,
+            }
+        }, indent=2),
+        media_type="application/json"
+    )
+
+# 2. STATS (agora funcionando)
 @app.get("/stats")
 async def get_stats():
-    with stats_lock:
-        if len(stats) == 0:
-            return json_response({"message": "Nenhuma requisição processada ainda."})
-        report = {}
-        for key, values in stats.items():
-            if not values:
-                continue
-            if key == 'num_segments':
-                report[key] = {
-                    "count": len(values),
-                    "mean": sum(values) / len(values),
-                    "min": min(values),
-                    "max": max(values),
-                }
-            else:
-                report[key] = {
-                    "count": len(values),
-                    "mean": sum(values) / len(values),
-                    "min": min(values),
-                    "max": max(values),
-                    "p95": sorted(values)[int(0.95 * len(values))] if len(values) > 1 else values[0],
-                }
-        return json_response(report)
+    with bench_stats_lock:
+        if not bench_stats["total"]:
+            return Response(
+                content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2),
+                media_type="application/json"
+            )
+        report = {
+            "total": compute_stats(list(bench_stats["total"])),
+            "tts_wall": compute_stats(list(bench_stats["tts_wall"])),
+            "mix": compute_stats(list(bench_stats["mix"])),
+            "queue_wait": compute_stats(list(bench_stats["queue_wait"])),
+        }
+    return Response(
+        content=json.dumps(report, indent=2),
+        media_type="application/json"
+    )
 
+# 3. LOGS (em memória)
+@app.get("/logs")
+async def get_logs():
+    return Response(
+        content=json.dumps({"logs": memory_handler.buffer}, indent=2),
+        media_type="application/json"
+    )
+
+# 4. WORKERS (detalhado)
 @app.get("/workers")
 async def get_workers():
     with worker_stats_lock:
@@ -917,36 +946,48 @@ async def get_workers():
                 "avg_time": data["avg_time"],
             })
         workers.sort(key=lambda x: (x["type"], x["id"]))
-        return json_response({
-            "total_workers": len(workers),
+    return Response(
+        content=json.dumps({
+            "tts_workers": TTS_WORKERS,
+            "mix_workers": MIX_WORKERS,
+            "active_tts_workers": len([w for w in workers if w["type"] == "tts"]),
+            "active_mix_workers": len([w for w in workers if w["type"] == "mix"]),
+            "per_worker": workers,
             "physical_cores": PHYSICAL_CORES,
             "hyper_thread_cores": HYPER_THREAD_CORES,
-            "tts_workers": [w for w in workers if w["type"] == "tts"],
-            "mix_workers": [w for w in workers if w["type"] == "mix"],
-        })
+        }, indent=2),
+        media_type="application/json"
+    )
 
-@app.get("/pool_status")
-async def pool_status():
-    with worker_stats_lock:
-        tts_count = sum(1 for k in worker_stats.keys() if k.startswith('tts_'))
-        mix_count = sum(1 for k in worker_stats.keys() if k.startswith('mix_'))
-    return json_response({
-        "tts_workers": TTS_WORKERS,
-        "mix_workers": MIX_WORKERS,
-        "tts_registered": tts_count,
-        "mix_registered": mix_count,
-        "physical_cores": PHYSICAL_CORES,
-        "hyper_thread_cores": HYPER_THREAD_CORES,
-        "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
-        "request_timeout": REQUEST_TIMEOUT,
-        "current_concurrency": request_semaphore._value if request_semaphore and hasattr(request_semaphore, '_value') else "disabled",
-    })
+# 5. RESOURCES
+@app.get("/resources")
+async def get_resources():
+    cpu_util = -1.0
+    try:
+        import psutil
+        cpu_util = psutil.cpu_percent(interval=0.1)
+    except:
+        pass
+    return Response(
+        content=json.dumps({
+            "cpu_utilization_percent": cpu_util,
+            "cpu_cores_available": os.cpu_count(),
+            "physical_cores": PHYSICAL_CORES,
+            "hyper_thread_cores": HYPER_THREAD_CORES,
+            "tts_workers": TTS_WORKERS,
+            "mix_workers": MIX_WORKERS,
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "request_timeout": REQUEST_TIMEOUT,
+        }, indent=2),
+        media_type="application/json"
+    )
 
+# 6. RESET_STATS
 @app.post("/reset_stats")
 async def reset_stats():
-    with stats_lock:
-        for key in list(stats.keys()):
-            stats[key] = []
+    with bench_stats_lock:
+        for key in bench_stats:
+            bench_stats[key] = manager.list()
     with worker_stats_lock:
         for key in list(worker_stats.keys()):
             data = worker_stats[key]
@@ -954,130 +995,211 @@ async def reset_stats():
             data["total_time"] = 0.0
             data["avg_time"] = 0.0
             worker_stats[key] = data
-    return json_response({"message": "Estatísticas resetadas com sucesso."})
+    return Response(
+        content=json.dumps({"message": "Estatísticas resetadas."}, indent=2),
+        media_type="application/json"
+    )
 
-# ---------- DIAGNÓSTICO ----------
-@app.get("/diagnose_cores")
-async def diagnose_cores():
-    try:
-        cpuinfo = []
-        with open('/proc/cpuinfo', 'r') as f:
-            lines = f.readlines()
-        current = {}
-        for line in lines:
-            if line.strip() == '':
-                if current:
-                    cpuinfo.append(current)
-                    current = {}
-                continue
-            key, val = line.split(':', 1)
-            current[key.strip()] = val.strip()
-        if current:
-            cpuinfo.append(current)
+# 7. CARGA (resultados do teste de carga)
+@app.get("/carga")
+async def get_carga():
+    if not BENCH_DIR.exists():
+        return Response(
+            content=json.dumps({"message": "Nenhum teste de carga ainda."}, indent=2),
+            media_type="application/json"
+        )
+    files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not files:
+        return Response(
+            content=json.dumps({"message": "Nenhum arquivo de carga."}, indent=2),
+            media_type="application/json"
+        )
+    with open(files[0], "r") as f:
+        data = json.load(f)
+    return Response(
+        content=json.dumps({
+            "file": files[0].name,
+            "data": data,
+            "available_files": [f.name for f in files]
+        }, indent=2),
+        media_type="application/json"
+    )
 
-        cores_map = {}
-        for cpu in cpuinfo:
-            if 'processor' in cpu and 'core id' in cpu:
-                proc = int(cpu['processor'])
-                core = int(cpu['core id'])
-                cores_map.setdefault(core, []).append(proc)
+# 8. CARGA_FILES
+@app.get("/carga_files")
+async def list_carga_files():
+    if not BENCH_DIR.exists():
+        return Response(content=json.dumps({"files": []}, indent=2), media_type="application/json")
+    files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return Response(
+        content=json.dumps({"files": [f.name for f in files]}, indent=2),
+        media_type="application/json"
+    )
 
-        siblings = {}
-        for cpu in ALL_CORES:
-            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
-            try:
-                with open(path, 'r') as f:
-                    siblings[cpu] = f.read().strip()
-            except:
-                siblings[cpu] = str(cpu)
+# 9. CARGA/{FILE_NAME}
+@app.get("/carga/{file_name}")
+async def get_carga_file(file_name: str):
+    file_path = BENCH_DIR / file_name
+    if not file_path.exists():
+        raise HTTPException(404, "Arquivo não encontrado")
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    return Response(content=json.dumps(data, indent=2), media_type="application/json")
 
-        workers_info = []
-        for key, data in worker_stats.items():
-            worker_type, worker_id = key.split('_')
-            pid = data["pid"]
-            cpu_id = data["cpu_id"]
-            is_physical = data.get("is_physical", False)
+# 10. RUN_LOAD_TEST (teste de carga local via POST)
+@app.post("/run_load_test")
+async def run_load_test(
+    ramp_max: int = 51,
+    step: int = 5,
+    duration: int = 30,
+    timeout: int = 30,
+    voice: Optional[str] = None,
+    speakers: Optional[List[Dict[str, Any]]] = None,
+    ambient_file: str = "ubs",
+    ambient_volume: float = -5.0,
+    effects: Optional[Dict[str, str]] = None,
+    dialogs: Optional[List[str]] = None,
+):
+    """
+    Executa teste de carga local.
+    
+    Parâmetros:
+    - voice: string (modo simples, uma voz)
+    - speakers: lista de dicts (modo diálogo) ex: [{"role":"paciente","voice":"crianca","speed":1.0}, {"role":"acompanhante","voice":"faber","speed":0.95}]
+    - Se ambos forem fornecidos, speakers tem prioridade.
+    """
+    import aiohttp, statistics, random
+    from contextlib import asynccontextmanager
 
-            try:
-                proc = psutil.Process(pid)
-                affinity = proc.cpu_affinity()
-                num_threads = len(proc.threads())
-                has_multiple_threads = num_threads > 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                affinity = "N/A"
-                num_threads = "N/A"
-                has_multiple_threads = "N/A"
+    # Se speakers for fornecido, usa modo diálogo
+    use_speakers = speakers is not None and len(speakers) > 0
 
-            workers_info.append({
-                "type": worker_type,
-                "id": int(worker_id),
-                "pid": pid,
-                "assigned_cpu": cpu_id,
-                "is_physical": is_physical,
-                "real_affinity": affinity,
-                "num_threads": num_threads,
-                "has_multiple_threads": has_multiple_threads,
-                "requests_processed": data["requests_processed"],
-                "avg_time": data["avg_time"],
-            })
+    # Se voice não for fornecido e speakers não for usado, pega a primeira voz disponível
+    if not use_speakers and voice is None:
+        voice = list(VOICE_PATHS.keys())[0] if VOICE_PATHS else "crianca"
 
-        physical_from_proc = sorted([min(cpus) for cpus in cores_map.values()]) if cores_map else []
-        physical_from_sys = []
-        for cpu in ALL_CORES:
-            path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
-            try:
-                with open(path, 'r') as f:
-                    sibs = f.read().strip().split(',')
-                    if int(sibs[0]) == cpu:
-                        physical_from_sys.append(cpu)
-            except:
-                pass
-        physical_from_sys = sorted(set(physical_from_sys))
+    # Efeitos padrão
+    if effects is None:
+        effects = {
+            "[tosse]": "tosse.wav",
+            "[suspiro]": "suspiro.wav",
+            "[inspiracao]": "inspiracao.wav"
+        }
 
-        return json_response({
-            "total_cores": os.cpu_count(),
-            "cores_map": cores_map,
-            "siblings": siblings,
-            "physical_cores_from_proc": physical_from_proc,
-            "physical_cores_from_sys": physical_from_sys,
-            "current_physical_cores": PHYSICAL_CORES,
-            "current_hyper_thread_cores": HYPER_THREAD_CORES,
-            "workers": workers_info,
-            "workers_with_multiple_threads": [w for w in workers_info if w.get("has_multiple_threads") is True],
-            "analysis": {
-                "threading_issue": any(w.get("has_multiple_threads") is True for w in workers_info),
-                "affinity_mismatch": any(
-                    w.get("real_affinity") != "N/A" and w.get("assigned_cpu") not in w.get("real_affinity", [])
-                    for w in workers_info
-                )
+    # Diálogos padrão (com tags [paciente] e [acompanhante])
+    if dialogs is None:
+        dialogs = [
+            "[paciente] Estou com dor de cabeça forte. [tosse] Ele está assim há três dias, doutor.",
+            "[paciente] Tenho tido muita tosse, [tosse]... [tosse].. [acompanhante] E febre desde ontem.",
+            "[paciente] Sinto falta de ar [inspiracao] ao caminhar. [acompanhante] Ele já tem histórico de asma.",
+            "[paciente] Estou muito cansada [inspiracao] e com falta de ar. [acompanhante] Ela parou de fumar há um mês.",
+            "[paciente] A febre começou ontem à noite, depois que ele caiu. [suspiro] Dói muito aqui!",
+            "[paciente] O remédio não está fazendo efeito. [acompanhante] Ele está tomando dipirona, mas não melhora.",
+            "[paciente] Precisamos de uma receita para antibiótico. [suspiro] Só dar o cu não está ajudando.",
+            "[paciente] Meu peito dói quando respiro fundo [inspiracao]. E ele chupou um pau de 25 centímetros?",
+            "[paciente] Quando posso voltar ao trabalho? [acompanhante] Precisa de atestado por mais três dias.",
+            "[paciente] Ele está com os exames alterados. [suspiro] Vou precisar de cirurgia?"
+        ]
+
+    BENCH_DIR.mkdir(exist_ok=True)
+    fname = BENCH_DIR / f"carga_results_local_{int(time.time())}.json"
+    results = []
+
+    logger.info(f"🚀 Iniciando teste de carga: ramp_max={ramp_max}, step={step}, duration={duration}s")
+    if use_speakers:
+        logger.info(f"   Modo diálogo com speakers: {speakers}")
+    else:
+        logger.info(f"   Modo simples com voice: {voice}")
+
+    async with aiohttp.ClientSession() as sess:
+        for concurrency in range(1, ramp_max + 1, step):
+            sem = asyncio.Semaphore(concurrency)
+            start = time.perf_counter()
+            succ = 0
+            fail = 0
+            lats = []
+            total_requests = 0
+
+            async def worker():
+                nonlocal succ, fail, lats, total_requests
+                while time.perf_counter() - start < duration:
+                    async with sem:
+                        d = random.choice(dialogs)
+                        # Monta o payload
+                        payload = {
+                            "text": d,
+                            "effects": effects,
+                            "ambient": {"enabled": True, "file": ambient_file, "volume_db": ambient_volume}
+                        }
+                        if use_speakers:
+                            payload["speakers"] = speakers
+                        else:
+                            payload["voice"] = voice
+
+                        t0 = time.perf_counter()
+                        try:
+                            async with sess.post("http://localhost:8000/synthesize", json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                                if resp.status == 200:
+                                    succ += 1
+                                    lats.append(time.perf_counter() - t0)
+                                else:
+                                    fail += 1
+                                total_requests += 1
+                        except Exception:
+                            fail += 1
+                            total_requests += 1
+                        await asyncio.sleep(0)
+
+            tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
+            await asyncio.sleep(duration)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            avg = statistics.mean(lats) if lats else 0.0
+            p95 = sorted(lats)[int(0.95 * len(lats))] if lats else 0.0
+            thr = succ / duration
+            err = fail / total_requests if total_requests else 1.0
+
+            point = {
+                "concurrency": concurrency,
+                "throughput": thr,
+                "avg_latency": avg,
+                "p95_latency": p95,
+                "error_rate": err,
+                "total_requests": total_requests,
+                "success_count": succ,
+                "failure_count": fail,
             }
-        })
-    except Exception as e:
-        logger.error(f"Erro no diagnose: {e}")
-        return json_response({"error": str(e)}, status_code=500)
+            results.append(point)
 
-# ---------- Definir cores físicos ----------
-class SetPhysicalCoresRequest(BaseModel):
-    cores: List[int]
+            logger.info(f"  Concorrência {concurrency}: throughput={thr:.2f} req/s | latência={avg:.3f}s | p95={p95:.3f}s | erros={err*100:.1f}%")
 
-@app.post("/set_physical_cores")
-async def set_physical_cores(req: SetPhysicalCoresRequest):
-    global PHYSICAL_CORES, HYPER_THREAD_CORES
-    new_cores = sorted(set(req.cores))
-    if not new_cores:
-        return json_response({"error": "Lista de cores vazia"}, status_code=400)
-    if max(new_cores) >= os.cpu_count() or min(new_cores) < 0:
-        return json_response({"error": "Core ID fora do intervalo"}, status_code=400)
+            with open(fname, "w") as f:
+                json.dump(results, f, indent=2)
 
-    PHYSICAL_CORES = new_cores
-    HYPER_THREAD_CORES = [c for c in ALL_CORES if c not in PHYSICAL_CORES]
-    logger.info(f"PHYSICAL_CORES alterado manualmente para: {PHYSICAL_CORES}")
-    return json_response({
-        "message": "Núcleos físicos atualizados. Reinicie a API para aplicar a todos os workers.",
-        "physical_cores": PHYSICAL_CORES,
-        "hyper_thread_cores": HYPER_THREAD_CORES,
-        "note": "Os workers já existentes não serão afetados; novos workers usarão esta configuração."
-    })
+    logger.info(f"✅ Teste concluído. Resultados em {fname}")
+    return Response(
+        content=json.dumps({
+            "message": "Teste de carga concluído.",
+            "file": fname.name,
+            "params": {
+                "ramp_max": ramp_max,
+                "step": step,
+                "duration": duration,
+                "timeout": timeout,
+                "mode": "dialog" if use_speakers else "simple",
+                "speakers": speakers if use_speakers else None,
+                "voice": voice if not use_speakers else None,
+                "ambient_file": ambient_file,
+                "ambient_volume": ambient_volume,
+                "effects": effects,
+            },
+            "data": results,
+        }, indent=2),
+        media_type="application/json"
+    )
+
 
 # ---------- Endpoints de saúde ----------
 @app.get("/started")
@@ -1089,8 +1211,7 @@ async def ready():
     async with warmup_lock:
         if warmup_complete:
             return Response(status_code=200, content="ready")
-        else:
-            return Response(status_code=503, content="loading models")
+        return Response(status_code=503, content="loading models")
 
 @app.get("/live")
 async def live():
@@ -1100,16 +1221,19 @@ async def live():
 async def health():
     async with warmup_lock:
         status = "ok" if warmup_complete else "loading"
-    return json_response({
-        "status": status,
-        "voices": list(VOICE_PATHS.keys()),
-        "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
-        "physical_cores": PHYSICAL_CORES,
-        "hyper_thread_cores": HYPER_THREAD_CORES,
-        "concurrency_limit": MAX_CONCURRENT_REQUESTS,
-        "timeout": REQUEST_TIMEOUT,
-        "warmup_complete": warmup_complete,
-    })
+    return Response(
+        content=json.dumps({
+            "status": status,
+            "voices": list(VOICE_PATHS.keys()),
+            "workers": {"tts": TTS_WORKERS, "mix": MIX_WORKERS},
+            "physical_cores": PHYSICAL_CORES,
+            "hyper_thread_cores": HYPER_THREAD_CORES,
+            "concurrency_limit": MAX_CONCURRENT_REQUESTS,
+            "timeout": REQUEST_TIMEOUT,
+            "warmup_complete": warmup_complete,
+        }, indent=2),
+        media_type="application/json"
+    )
 
 # ---------- Ponto de entrada ----------
 if __name__ == "__main__":
