@@ -6,7 +6,7 @@ import json
 import logging
 import subprocess
 import tempfile
-import wave
+import wave  # <-- IMPORT ADICIONADO AQUI
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
@@ -180,7 +180,7 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador TTS ----------
+# ---------- Inicializador TTS com pré-carregamento ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -201,18 +201,16 @@ def _init_tts_worker():
     pid = os.getpid()
     register_worker("tts", worker_id, pid, cpu_id, is_physical=True)
 
-    # ---------- PRÉ-CARREGAMENTO DE TODAS AS VOZES ----------
     mod = sys.modules['__main__']
     mod._worker_cpu_id = cpu_id
     mod._worker_voice_cache = {}
 
-    # Carrega todas as vozes disponíveis
+    # PRÉ-CARREGAMENTO DE TODAS AS VOZES
     logger.info(f"Worker {pid} iniciando pré-carregamento de {len(VOICE_PATHS)} vozes...")
     load_start = time.perf_counter()
     for voice_name in VOICE_PATHS.keys():
         try:
-            # Isso força o carregamento do modelo
-            pool = get_voice_pool(voice_name)  # A função já usa o cache
+            pool = get_voice_pool(voice_name)  # Força o carregamento
             logger.debug(f"  Voz '{voice_name}' carregada")
         except Exception as e:
             logger.error(f"  Falha ao carregar voz '{voice_name}': {e}")
@@ -355,14 +353,13 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- MIXAGEM E CONCATENAÇÃO CORRIGIDA (com loop de ambiente) ----------
+# ---------- MIXAGEM E CONCATENAÇÃO CORRIGIDA ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     logger.info("=" * 60)
     logger.info("🔊 INÍCIO DA MIXAGEM/CONCATENAÇÃO")
     logger.info(f"📦 Recebidos {len(segments_data)} segmentos")
 
-    # --- LOG DA ORDEM ---
     logger.info("📋 Ordem dos segmentos:")
     for i, data in enumerate(segments_data):
         if 'pcm_bytes' in data:
@@ -410,19 +407,13 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
-                # Carrega o ambiente em memória para medir duração
-                import wave
+                # Mede duração do ambiente original
                 with wave.open(str(ambient_path), 'rb') as wf:
                     ambient_frames = wf.getnframes()
                     ambient_rate = wf.getframerate()
                     ambient_duration = ambient_frames / ambient_rate
                 logger.info(f"🌧️ Ambiente '{ambient_cfg['file']}.wav' tem duração de {ambient_duration:.2f}s")
 
-                # Cria um arquivo temporário com o ambiente repetido (loop)
-                # Primeiro, concatena os segmentos para saber a duração total
-                # Mas ainda não temos o áudio principal. Vamos fazer o loop depois.
-                # Para simplificar, vamos criar o ambiente estendido após a concatenação.
-                # Por enquanto, apenas copiamos o ambiente original.
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     with open(ambient_path, 'rb') as src:
                         f.write(src.read())
@@ -436,7 +427,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             raise ValueError("Nenhum arquivo para processar")
 
         # --- CONCATENAÇÃO DOS SEGMENTOS (voz + efeitos) ---
-        # Separa o ambiente do resto (se adicionado)
         if ambient_added:
             ambient_file = temp_files[-1]
             voice_files = temp_files[:-1]
@@ -444,7 +434,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             voice_files = temp_files
             ambient_file = None
 
-        logger.info("🔧 Montando comando FFmpeg...")
         logger.info(f"📊 Total de arquivos de voz/efeitos: {len(voice_files)}")
 
         # Concatena voz + efeitos
@@ -473,24 +462,19 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
 
         # --- SE HOUVER AMBIENTE, FAZ O LOOP E MIXA ---
         if ambient_added and ambient_file:
-            # Calcula duração do áudio principal
-            main_duration = len(main_audio_bytes) / (target_rate * 2)  # 2 bytes por sample (16-bit)
+            main_duration = len(main_audio_bytes) / (target_rate * 2)
             logger.info(f"📏 Duração do áudio principal: {main_duration:.2f}s")
 
-            # Calcula duração do ambiente
             with wave.open(ambient_file, 'rb') as wf:
                 amb_frames = wf.getnframes()
                 amb_rate = wf.getframerate()
                 amb_duration = amb_frames / amb_rate
             logger.info(f"📏 Duração do ambiente original: {amb_duration:.2f}s")
 
-            # Se o ambiente for mais curto, repetir (loop)
             if amb_duration < main_duration:
                 repeat_times = int(main_duration // amb_duration) + 2
-                logger.info(f"🔄 Ambiente precisa ser repetido {repeat_times} vezes para cobrir {main_duration:.2f}s")
+                logger.info(f"🔄 Ambiente repetido {repeat_times} vezes para cobrir {main_duration:.2f}s")
 
-                # Cria um arquivo com o ambiente repetido
-                # Usa o filtro `concat` do FFmpeg para repetir N vezes
                 loop_cmd = ["ffmpeg", "-y", "-stream_loop", str(repeat_times), "-i", ambient_file,
                            "-c", "copy", "-f", "wav", "pipe:1"]
                 logger.info(f"🔄 Comando de loop do ambiente:")
@@ -501,13 +485,11 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 looped_ambient_bytes = result_loop.stdout
                 logger.info(f"✅ Loop do ambiente concluído em {t_loop:.3f}s | tamanho={len(looped_ambient_bytes)/1024:.1f}KB")
 
-                # Salva o ambiente estendido em um arquivo temporário
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb_loop:
                     f_amb_loop.write(looped_ambient_bytes)
                     looped_ambient_file = f_amb_loop.name
                 logger.info(f"📁 Ambiente estendido salvo em: {looped_ambient_file}")
 
-                # Agora mixa o áudio principal com o ambiente estendido
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
                     f_main.write(main_audio_bytes)
                     main_file = f_main.name
@@ -534,14 +516,12 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                 wav_bytes = result_mix.stdout
                 logger.info(f"✅ Mixagem concluída em {t_mix:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
 
-                # Limpa temporários extras
                 for f in [main_file, looped_ambient_file]:
                     try:
                         os.unlink(f)
                     except:
                         pass
             else:
-                # Ambiente já é mais longo, mixa diretamente
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
                     f_main.write(main_audio_bytes)
                     main_file = f_main.name
@@ -579,10 +559,8 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     except:
                         pass
         else:
-            # Sem ambiente: usa o áudio principal
             wav_bytes = main_audio_bytes
 
-        # --- LOG FINAL ---
         t_total = time.perf_counter() - t0
         logger.info(f"🎯 MIXAGEM/CONCATENAÇÃO FINALIZADA em {t_total:.3f}s")
         logger.info(f"📦 Tamanho final do áudio: {len(wav_bytes)/1024:.1f}KB")
@@ -601,7 +579,7 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
 
-# ---------- Processamento TTS (corrigido: efeitos primeiro) ----------
+# ---------- Processamento TTS ----------
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -640,7 +618,7 @@ def process_tts_only(
     for part in parts:
         logger.debug(f"🔍 Processando parte: '{part}'")
 
-        # --- 1. VERIFICA SE É EFEITO (ANTES DE TAG DE SPEAKER) ---
+        # --- 1. EFEITO (ANTES DE TAG) ---
         if part in effects:
             effect_file = effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
@@ -648,7 +626,7 @@ def process_tts_only(
             logger.info(f"🎬 Efeito adicionado: '{part}' -> '{effect_file}' (voz: {voice_for_eff})")
             continue
 
-        # --- 2. VERIFICA SE É TAG DE SPEAKER ---
+        # --- 2. TAG DE SPEAKER ---
         if is_dialog and part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if role in speaker_map:
@@ -656,7 +634,7 @@ def process_tts_only(
                 logger.info(f"🔄 Speaker trocado para: {current_role}")
             continue
 
-        # --- 3. SÍNTESE DE TEXTO ---
+        # --- 3. SÍNTESE ---
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -901,7 +879,7 @@ async def reset_stats():
             worker_stats[key] = data
     return json_response({"message": "Estatísticas resetadas com sucesso."})
 
-# ---------- DIAGNÓSTICO COMPLETO ----------
+# ---------- DIAGNÓSTICO ----------
 @app.get("/diagnose_cores")
 async def diagnose_cores():
     try:
@@ -1001,7 +979,7 @@ async def diagnose_cores():
         logger.error(f"Erro no diagnose: {e}")
         return json_response({"error": str(e)}, status_code=500)
 
-# ---------- Definir cores físicos manualmente ----------
+# ---------- Definir cores físicos ----------
 class SetPhysicalCoresRequest(BaseModel):
     cores: List[int]
 
