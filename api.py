@@ -6,7 +6,7 @@ import json
 import logging
 import subprocess
 import tempfile
-import wave  # <-- IMPORT ADICIONADO AQUI
+import wave
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
@@ -56,7 +56,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)  # DEBUG para mais detalhes
 
 ort.set_default_logger_severity(3)
 
@@ -180,7 +180,7 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador TTS com pré-carregamento ----------
+# ---------- Inicializador TTS com pré-carregamento em paralelo ----------
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -205,13 +205,12 @@ def _init_tts_worker():
     mod._worker_cpu_id = cpu_id
     mod._worker_voice_cache = {}
 
-    # PRÉ-CARREGAMENTO DE TODAS AS VOZES
+    # PRÉ-CARREGAMENTO DE TODAS AS VOZES (em paralelo com os outros workers)
     logger.info(f"Worker {pid} iniciando pré-carregamento de {len(VOICE_PATHS)} vozes...")
     load_start = time.perf_counter()
     for voice_name in VOICE_PATHS.keys():
         try:
             pool = get_voice_pool(voice_name)  # Força o carregamento
-            logger.debug(f"  Voz '{voice_name}' carregada")
         except Exception as e:
             logger.error(f"  Falha ao carregar voz '{voice_name}': {e}")
     load_time = time.perf_counter() - load_start
@@ -333,7 +332,6 @@ def get_voice_pool(voice_name):
         model_path, config_path = VOICE_PATHS[voice_name]
         pool = VoicePool(model_path, config_path, pool_size=1)
         cache[voice_name] = pool
-        logger.info(f"Worker {os.getpid()} carregou voz {voice_name}")
     return cache[voice_name]
 
 def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
@@ -353,7 +351,7 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- MIXAGEM E CONCATENAÇÃO CORRIGIDA ----------
+# ---------- MIXAGEM CORRIGIDA ----------
 def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     t0 = time.perf_counter()
     logger.info("=" * 60)
@@ -402,17 +400,19 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             else:
                 logger.warning(f"  [{idx}] Ignorado: dados desconhecidos")
 
-        # --- ADICIONAR AMBIENTE (com loop) ---
+        # --- ADICIONAR AMBIENTE ---
+        ambient_volume_db = ambient_cfg.get('volume_db', -15.0)
         ambient_added = False
+        ambient_original_duration = 0.0
+
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
-                # Mede duração do ambiente original
                 with wave.open(str(ambient_path), 'rb') as wf:
                     ambient_frames = wf.getnframes()
                     ambient_rate = wf.getframerate()
-                    ambient_duration = ambient_frames / ambient_rate
-                logger.info(f"🌧️ Ambiente '{ambient_cfg['file']}.wav' tem duração de {ambient_duration:.2f}s")
+                    ambient_original_duration = ambient_frames / ambient_rate
+                logger.info(f"🌧️ Ambiente '{ambient_cfg['file']}.wav' duração original: {ambient_original_duration:.2f}s, volume: {ambient_volume_db}dB")
 
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     with open(ambient_path, 'rb') as src:
@@ -458,106 +458,93 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         result_concat = subprocess.run(concat_cmd, capture_output=True, check=True, timeout=10)
         t_concat = time.perf_counter() - t_concat_start
         main_audio_bytes = result_concat.stdout
-        logger.info(f"✅ Concatenação concluída em {t_concat:.3f}s | tamanho={len(main_audio_bytes)/1024:.1f}KB")
+        main_duration = len(main_audio_bytes) / (target_rate * 2)
+        logger.info(f"✅ Concatenação concluída em {t_concat:.3f}s | duração={main_duration:.2f}s | tamanho={len(main_audio_bytes)/1024:.1f}KB")
 
         # --- SE HOUVER AMBIENTE, FAZ O LOOP E MIXA ---
         if ambient_added and ambient_file:
-            main_duration = len(main_audio_bytes) / (target_rate * 2)
-            logger.info(f"📏 Duração do áudio principal: {main_duration:.2f}s")
-
-            with wave.open(ambient_file, 'rb') as wf:
-                amb_frames = wf.getnframes()
-                amb_rate = wf.getframerate()
-                amb_duration = amb_frames / amb_rate
-            logger.info(f"📏 Duração do ambiente original: {amb_duration:.2f}s")
-
-            if amb_duration < main_duration:
-                repeat_times = int(main_duration // amb_duration) + 2
-                logger.info(f"🔄 Ambiente repetido {repeat_times} vezes para cobrir {main_duration:.2f}s")
-
-                loop_cmd = ["ffmpeg", "-y", "-stream_loop", str(repeat_times), "-i", ambient_file,
-                           "-c", "copy", "-f", "wav", "pipe:1"]
-                logger.info(f"🔄 Comando de loop do ambiente:")
-                logger.info(f"  {' '.join(loop_cmd)}")
-                t_loop_start = time.perf_counter()
-                result_loop = subprocess.run(loop_cmd, capture_output=True, check=True, timeout=10)
-                t_loop = time.perf_counter() - t_loop_start
-                looped_ambient_bytes = result_loop.stdout
-                logger.info(f"✅ Loop do ambiente concluído em {t_loop:.3f}s | tamanho={len(looped_ambient_bytes)/1024:.1f}KB")
-
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb_loop:
-                    f_amb_loop.write(looped_ambient_bytes)
-                    looped_ambient_file = f_amb_loop.name
-                logger.info(f"📁 Ambiente estendido salvo em: {looped_ambient_file}")
-
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
-                    f_main.write(main_audio_bytes)
-                    main_file = f_main.name
-
-                mix_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", main_file,
-                    "-i", looped_ambient_file,
-                    "-filter_complex", "amix=inputs=2:duration=longest",
-                    "-ar", str(target_rate),
-                    "-ac", "1",
-                    "-c:a", "pcm_s16le",
-                    "-f", "wav",
-                    "pipe:1"
-                ]
-
-                logger.info(f"🔀 Comando de mixagem (ambiente):")
-                logger.info(f"  {' '.join(mix_cmd)}")
-
-                logger.info("⏳ Executando mixagem...")
-                t_mix_start = time.perf_counter()
-                result_mix = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
-                t_mix = time.perf_counter() - t_mix_start
-                wav_bytes = result_mix.stdout
-                logger.info(f"✅ Mixagem concluída em {t_mix:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
-
-                for f in [main_file, looped_ambient_file]:
-                    try:
-                        os.unlink(f)
-                    except:
-                        pass
+            # Calcula quantas repetições do ambiente são necessárias
+            if ambient_original_duration > 0:
+                repeat_times = int(main_duration // ambient_original_duration) + 1
             else:
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
-                    f_main.write(main_audio_bytes)
-                    main_file = f_main.name
+                repeat_times = 1
 
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb:
-                    with open(ambient_file, 'rb') as src:
-                        f_amb.write(src.read())
-                    amb_file = f_amb.name
+            logger.info(f"🔄 Ambiente original: {ambient_original_duration:.2f}s, precisamos cobrir {main_duration:.2f}s")
+            logger.info(f"🔄 Ambiente será repetido {repeat_times} vezes")
 
-                mix_cmd = [
+            # Cria o ambiente estendido (loop) usando -stream_loop
+            loop_cmd = ["ffmpeg", "-y", "-stream_loop", str(repeat_times), "-i", ambient_file,
+                       "-c", "copy", "-f", "wav", "pipe:1"]
+            logger.info(f"🔄 Comando de loop do ambiente:")
+            logger.info(f"  {' '.join(loop_cmd)}")
+            t_loop_start = time.perf_counter()
+            result_loop = subprocess.run(loop_cmd, capture_output=True, check=True, timeout=10)
+            t_loop = time.perf_counter() - t_loop_start
+            looped_ambient_bytes = result_loop.stdout
+            looped_duration = len(looped_ambient_bytes) / (target_rate * 2)
+            logger.info(f"✅ Loop do ambiente concluído em {t_loop:.3f}s | duração={looped_duration:.2f}s | tamanho={len(looped_ambient_bytes)/1024:.1f}KB")
+
+            # **CORREÇÃO: Corta o ambiente estendido para a duração EXATA do diálogo**
+            # Se o ambiente estendido for maior que o diálogo, corta no tamanho exato
+            if looped_duration > main_duration:
+                logger.info(f"✂️ Ambiente estendido ({looped_duration:.2f}s) é maior que o diálogo ({main_duration:.2f}s). Cortando...")
+                # Corta usando ffmpeg com filtro trim
+                trim_cmd = [
                     "ffmpeg", "-y",
-                    "-i", main_file,
-                    "-i", amb_file,
-                    "-filter_complex", "amix=inputs=2:duration=longest",
+                    "-i", "pipe:0",
+                    "-filter_complex", f"atrim=0:{main_duration}",
                     "-ar", str(target_rate),
                     "-ac", "1",
                     "-c:a", "pcm_s16le",
                     "-f", "wav",
                     "pipe:1"
                 ]
+                result_trim = subprocess.run(trim_cmd, input=looped_ambient_bytes, capture_output=True, check=True, timeout=10)
+                looped_ambient_bytes = result_trim.stdout
+                looped_duration = len(looped_ambient_bytes) / (target_rate * 2)
+                logger.info(f"✅ Ambiente cortado para {looped_duration:.2f}s | tamanho={len(looped_ambient_bytes)/1024:.1f}KB")
 
-                logger.info(f"🔀 Comando de mixagem (ambiente):")
-                logger.info(f"  {' '.join(mix_cmd)}")
+            # Salva o ambiente (já cortado) em um arquivo temporário
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_amb_loop:
+                f_amb_loop.write(looped_ambient_bytes)
+                looped_ambient_file = f_amb_loop.name
+            logger.info(f"📁 Ambiente final salvo em: {looped_ambient_file}")
 
-                logger.info("⏳ Executando mixagem...")
-                t_mix_start = time.perf_counter()
-                result_mix = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
-                t_mix = time.perf_counter() - t_mix_start
-                wav_bytes = result_mix.stdout
-                logger.info(f"✅ Mixagem concluída em {t_mix:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
+            # Salva o áudio principal
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f_main:
+                f_main.write(main_audio_bytes)
+                main_file = f_main.name
 
-                for f in [main_file, amb_file]:
-                    try:
-                        os.unlink(f)
-                    except:
-                        pass
+            # **CORREÇÃO: Aplica o volume do ambiente usando o filtro volume**
+            # O volume_db é aplicado como ganho negativo
+            volume_filter = f"volume={ambient_volume_db}dB"
+            mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", main_file,
+                "-i", looped_ambient_file,
+                "-filter_complex", f"[1]{volume_filter}[amb];[0][amb]amix=inputs=2:duration=shortest",
+                "-ar", str(target_rate),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ]
+
+            logger.info(f"🔀 Comando de mixagem (ambiente com volume {ambient_volume_db}dB):")
+            logger.info(f"  {' '.join(mix_cmd)}")
+
+            logger.info("⏳ Executando mixagem...")
+            t_mix_start = time.perf_counter()
+            result_mix = subprocess.run(mix_cmd, capture_output=True, check=True, timeout=10)
+            t_mix = time.perf_counter() - t_mix_start
+            wav_bytes = result_mix.stdout
+            logger.info(f"✅ Mixagem concluída em {t_mix:.3f}s | tamanho={len(wav_bytes)/1024:.1f}KB")
+
+            for f in [main_file, looped_ambient_file]:
+                try:
+                    os.unlink(f)
+                except:
+                    pass
         else:
             wav_bytes = main_audio_bytes
 
@@ -679,6 +666,37 @@ mix_pool = ProcessPoolExecutor(
     max_workers=MIX_WORKERS,
     initializer=_init_mix_worker
 )
+
+# ---------- WARM-UP: força o pré-carregamento em todos os workers ANTES de aceitar requisições ----------
+def warmup_workers():
+    """Envia uma requisição dummy para cada worker TTS forçar o carregamento dos modelos."""
+    logger.info("🔥 Iniciando warm-up dos workers TTS...")
+    warmup_start = time.perf_counter()
+    futures = []
+    # Envia uma tarefa dummy para cada worker (usando um texto curto)
+    dummy_text = "Teste."
+    dummy_voice = list(VOICE_PATHS.keys())[0] if VOICE_PATHS else "crianca"
+    for _ in range(TTS_WORKERS):
+        future = tts_pool.submit(
+            process_tts_only,
+            dummy_voice,
+            dummy_text,
+            1.0,
+            0.667,
+            0.8,
+            {},
+            [],
+            time.perf_counter()
+        )
+        futures.append(future)
+    # Aguarda todos os workers terminarem o warm-up
+    for future in futures:
+        try:
+            future.result(timeout=30)
+        except Exception as e:
+            logger.warning(f"Warm-up falhou: {e}")
+    warmup_time = time.perf_counter() - warmup_start
+    logger.info(f"✅ Warm-up concluído em {warmup_time:.2f}s")
 
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
@@ -1029,6 +1047,9 @@ async def health():
         "timeout": REQUEST_TIMEOUT,
     })
 
+# ---------- Ponto de entrada ----------
 if __name__ == "__main__":
     import uvicorn
+
+    # Inicia o servidor Uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
