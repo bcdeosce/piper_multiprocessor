@@ -23,7 +23,6 @@ import onnxruntime as ort
 _original_ort_session = ort.InferenceSession
 
 def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
-    """Cria uma sessão ONNX com intra_op_num_threads=1 forçado."""
     if sess_options is None:
         sess_options = ort.SessionOptions()
     sess_options.intra_op_num_threads = 1
@@ -68,6 +67,61 @@ EFFECTS_DIR = BASE_DIR / "effects"
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
+
+TARGET_SAMPLE_RATE = 22050
+TARGET_CHANNELS = 1
+TARGET_SAMPLE_WIDTH = 2  # 16 bits
+
+# ---------- FUNÇÃO PARA CONVERTER TODOS OS ÁUDIOS NO INÍCIO ----------
+def convert_audio_to_target(file_path: Path) -> bool:
+    """Converte um arquivo de áudio para o formato alvo (22050Hz, mono, 16-bit PCM)."""
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(file_path),
+            "-ar", str(TARGET_SAMPLE_RATE),
+            "-ac", str(TARGET_CHANNELS),
+            "-sample_fmt", "s16",
+            "-c:a", "pcm_s16le",
+            str(file_path) + ".tmp"
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+        os.replace(str(file_path) + ".tmp", str(file_path))
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao converter {file_path}: {e}")
+        return False
+
+def convert_all_audio_files():
+    """Varre os diretórios e converte todos os .wav para o formato padrão."""
+    logger.info("Convertendo todos os arquivos de áudio para o formato padrão...")
+    converted = 0
+    errors = 0
+
+    for wav in AMBIENT_DIR.glob("*.wav"):
+        if convert_audio_to_target(wav):
+            converted += 1
+        else:
+            errors += 1
+
+    for wav in EFFECTS_DIR.glob("*.wav"):
+        if convert_audio_to_target(wav):
+            converted += 1
+        else:
+            errors += 1
+
+    for voice_dir in VOICES_DIR.iterdir():
+        if voice_dir.is_dir():
+            for wav in voice_dir.glob("*.wav"):
+                if convert_audio_to_target(wav):
+                    converted += 1
+                else:
+                    errors += 1
+
+    logger.info(f"Conversão concluída: {converted} arquivos convertidos, {errors} erros.")
+
+# Executa a conversão antes de qualquer outra operação
+convert_all_audio_files()
 
 # ---------- Detecção de núcleos físicos ----------
 def get_physical_cores_from_proc() -> List[int]:
@@ -245,13 +299,12 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool (carrega o Piper normalmente) ----------
+# ---------- VoicePool ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            # O Piper agora cria a sessão via nosso monkey patch, que força intra_op_num_threads=1
             voice = PiperVoice.load(
                 model_path,
                 config_path=config_path,
@@ -341,13 +394,14 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem ----------
-def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+# ---------- FUNÇÃO DE MIXAGEM (concat + ambiente em loop com ganho) ----------
+def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_SAMPLE_RATE):
     t0 = time.perf_counter()
     temp_files = []
     ffmpeg_cmd = ["ffmpeg", "-y"]
 
     try:
+        # 1. Cria arquivos temporários para cada segmento (fala e efeitos)
         for data in segments_data:
             if 'pcm_bytes' in data:
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
@@ -366,30 +420,60 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     effect_path = EFFECTS_DIR / data['effect']
                 if not effect_path.exists():
                     raise FileNotFoundError(f"Efeito '{data['effect']}' não encontrado")
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    with open(effect_path, 'rb') as src:
-                        f.write(src.read())
-                    temp_files.append(f.name)
+                temp_files.append(str(effect_path))
             else:
                 continue
 
-        if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
-            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
-            if ambient_path.exists():
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                    with open(ambient_path, 'rb') as src:
-                        f.write(src.read())
-                    temp_files.append(f.name)
-
         if not temp_files:
-            raise ValueError("Nenhum arquivo para mixar")
+            raise ValueError("Nenhum segmento para processar")
 
+        # 2. Adiciona ambiente (se habilitado)
+        ambient_enabled = ambient_cfg.get('enabled', False) and ambient_cfg.get('file')
+        ambient_file = None
+        ambient_nframes = 0
+        volume_db = ambient_cfg.get('volume_db', -15.0)
+
+        if ambient_enabled:
+            ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
+            if not ambient_path.exists():
+                raise FileNotFoundError(f"Ambiente '{ambient_cfg['file']}.wav' não encontrado")
+
+            with wave.open(str(ambient_path), 'rb') as wf:
+                ambient_nframes = wf.getnframes()
+            temp_files.append(str(ambient_path))
+            ambient_file = str(ambient_path)
+
+        # 3. Monta comando FFmpeg
         for f in temp_files:
             ffmpeg_cmd.extend(["-i", f])
 
-        filter_complex = f"amix=inputs={len(temp_files)}:duration=longest"
+        # 4. Constrói filtros
+        filters = []
+        if ambient_file:
+            num_segments = len(temp_files) - 1
+        else:
+            num_segments = len(temp_files)
+
+        if num_segments == 1:
+            concat_filter = f"[0:a]"
+        else:
+            inputs = "".join(f"[{i}:a]" for i in range(num_segments))
+            concat_filter = f"{inputs}concat=n={num_segments}:v=0:a=1[conca]"
+
+        if ambient_file:
+            ambient_idx = num_segments
+            size = ambient_nframes
+            # APLICA O GANHO (volume_db) E DEPOIS LOOP INFINITO
+            loop_filter = f"[{ambient_idx}:a]volume={volume_db}dB,aloop=loop=-1:size={size}[amb_loop]"
+            mix_filter = "[conca][amb_loop]amix=inputs=2:duration=longest[out]"
+            filters = [concat_filter, loop_filter, mix_filter]
+        else:
+            filters = [concat_filter + "[out]"]
+
+        filter_complex = "; ".join(filters)
+        ffmpeg_cmd.extend(["-filter_complex", filter_complex])
         ffmpeg_cmd.extend([
-            "-filter_complex", filter_complex,
+            "-map", "[out]",
             "-ar", str(target_rate),
             "-ac", "1",
             "-c:a", "pcm_s16le",
@@ -397,11 +481,13 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             "pipe:1"
         ])
 
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=10)
+        # 5. Executa
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=15)
         wav_bytes = result.stdout
 
         t_total = time.perf_counter() - t0
 
+        # Atualiza estatísticas do worker de mixagem
         try:
             cpu_id = os.sched_getaffinity(0)
             cpu_id = next(iter(cpu_id))
@@ -417,7 +503,8 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
     finally:
         for f in temp_files:
             try:
-                os.unlink(f)
+                if os.path.exists(f):
+                    os.unlink(f)
             except:
                 pass
 
@@ -537,7 +624,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Monkey Patch)")
+app = FastAPI(title="Piper TTS API (Concat + Ambiente Loop com Ganho)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
@@ -576,6 +663,7 @@ async def synthesize(req: TTSRequest):
         enqueue_time = time.perf_counter()
         loop = asyncio.get_running_loop()
 
+        # 1. TTS
         tts_future = loop.run_in_executor(
             tts_pool,
             process_tts_only,
@@ -590,12 +678,13 @@ async def synthesize(req: TTSRequest):
         )
         segments, tts_metrics = await asyncio.wait_for(tts_future, timeout=REQUEST_TIMEOUT)
 
+        # 2. Mixagem
         mix_future = loop.run_in_executor(
             mix_pool,
             mix_and_export_task,
             segments,
             ambient_dict,
-            22050
+            TARGET_SAMPLE_RATE
         )
         wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
 
