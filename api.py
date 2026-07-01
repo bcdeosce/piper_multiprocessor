@@ -156,7 +156,7 @@ logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 
 
 #---------- Pré-carrega os efeitos
-
+EFFECTS_CACHE = {}
 def preload_effects():
     """Carrega todos os efeitos disponíveis e os normaliza para mono, target_rate, PCM 16-bit."""
     logger.info("Pré-carregando efeitos...")
