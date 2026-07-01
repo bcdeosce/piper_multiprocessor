@@ -561,22 +561,32 @@ def process_tts_only(
     parts = re.split(r'(\[.*?\])', text)
     parts = [p.strip() for p in parts if p.strip()]
 
+    # LOG: mostrar todas as partes para debug
+    logger.info(f"📋 Partes divididas: {parts}")
+
     segments = []
     synth_time_total = 0.0
 
     for part in parts:
-        if is_dialog and part.startswith('[') and part.endswith(']'):
-            role = part[1:-1]
-            if role in speaker_map:
-                current_role = role
-            continue
+        logger.debug(f"🔍 Processando parte: '{part}'")
 
+        # --- 1. VERIFICA SE É EFEITO (ANTES DE TAG DE SPEAKER) ---
         if part in effects:
             effect_file = effects[part]
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
+            logger.info(f"🎬 Efeito adicionado: '{part}' -> '{effect_file}' (voz: {voice_for_eff})")
             continue
 
+        # --- 2. VERIFICA SE É TAG DE SPEAKER ---
+        if is_dialog and part.startswith('[') and part.endswith(']'):
+            role = part[1:-1]
+            if role in speaker_map:
+                current_role = role
+                logger.info(f"🔄 Speaker trocado para: {current_role}")
+            continue
+
+        # --- 3. SÍNTESE DE TEXTO ---
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -587,10 +597,12 @@ def process_tts_only(
             ns = noise_scale
             nw = noise_w_scale
 
+        logger.info(f"🗣️ Sintetizando (voz={v_name}, speed={spd}): '{part[:50]}...'")
         t_synth_start = time.perf_counter()
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
+        logger.info(f"✅ Áudio gerado: sample_rate={sample_rate}, tamanho={len(pcm_bytes)/1024:.1f}KB")
 
     total_worker_time = time.perf_counter() - t_worker_start
 
