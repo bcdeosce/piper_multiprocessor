@@ -15,16 +15,19 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import asyncio
 from collections import defaultdict
 
-# ---------- CRÍTICO: Define variáveis de ambiente ANTES de importar onnxruntime ----------
+# ============================================================================
+# 1. CONFIGURAÇÕES CRÍTICAS (ANTES DE QUALQUER IMPORTAÇÃO)
+# ============================================================================
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ORT_NUM_THREADS"] = "1"
 
-# ---------- MONKEY PATCH DO ONNX RUNTIME (ANTES DE IMPORTAR O PIPER) ----------
+# ============================================================================
+# 2. MONKEY PATCH NO ONNX RUNTIME (FORÇA 1 THREAD)
+# ============================================================================
 import onnxruntime as ort
 _original_ort_session = ort.InferenceSession
 
 def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
-    """Cria uma sessão ONNX com intra_op_num_threads=1 forçado."""
     if sess_options is None:
         sess_options = ort.SessionOptions()
     sess_options.intra_op_num_threads = 1
@@ -34,7 +37,9 @@ def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs
 
 ort.InferenceSession = _patched_ort_session
 
-# ---------- Instalação automática do psutil (para diagnóstico) ----------
+# ============================================================================
+# 3. IMPORTAÇÕES (APÓS O PATCH)
+# ============================================================================
 try:
     import psutil
 except ImportError:
@@ -52,15 +57,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 
-# ---------- Configuração de logs ----------
+# ============================================================================
+# 4. LOGGING
+# ============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(processName)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("piper-api")
-
 ort.set_default_logger_severity(3)
 
+# ============================================================================
+# 5. DIRETÓRIOS
+# ============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
@@ -70,7 +79,9 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Detecção de núcleos físicos ----------
+# ============================================================================
+# 6. DETECÇÃO DE NÚCLEOS FÍSICOS
+# ============================================================================
 def get_physical_cores_from_proc() -> List[int]:
     cores = {}
     try:
@@ -135,11 +146,67 @@ logger.info(f"Núcleos totais: {ALL_CORES}")
 logger.info(f"Núcleos físicos: {PHYSICAL_CORES}")
 logger.info(f"Núcleos Hyper-Thread: {HYPER_THREAD_CORES}")
 
-# ---------- Contador e locks ----------
+# ============================================================================
+# 7. PRÉ-CARREGAMENTO DE EFEITOS (CACHE GLOBAL)
+# ============================================================================
+EFFECTS_CACHE = {}
+TARGET_RATE = 22050
+
+def preload_effects():
+    """Carrega todos os efeitos disponíveis e normaliza para mono, TARGET_RATE, PCM 16-bit."""
+    logger.info("Pré-carregando efeitos...")
+    for effect_file in EFFECTS_DIR.glob("*.wav"):
+        effect_name = effect_file.name
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(effect_file),
+                "-ar", str(TARGET_RATE),
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                "pipe:1"
+            ]
+            result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
+            EFFECTS_CACHE[effect_name] = result.stdout
+            logger.info(f"Efeito pré-carregado: {effect_name}")
+        except Exception as e:
+            logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
+
+    # Também procura efeitos nas pastas das vozes
+    for voice_name in VOICE_PATHS.keys():
+        voice_dir = VOICES_DIR / voice_name
+        for effect_file in voice_dir.glob("*.wav"):
+            effect_name = effect_file.name
+            if effect_name in EFFECTS_CACHE:
+                continue
+            try:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(effect_file),
+                    "-ar", str(TARGET_RATE),
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    "-f", "wav",
+                    "pipe:1"
+                ]
+                result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
+                EFFECTS_CACHE[effect_name] = result.stdout
+                logger.info(f"Efeito pré-carregado (voz): {effect_name}")
+            except Exception as e:
+                logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
+
+    logger.info(f"Total de efeitos pré-carregados: {len(EFFECTS_CACHE)}")
+
+# ============================================================================
+# 8. CONTADOR GLOBAL E LOCKS
+# ============================================================================
 _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
-# ---------- Workers ----------
+# ============================================================================
+# 9. WORKERS (VARIÁVEIS DE AMBIENTE)
+# ============================================================================
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 8))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 3))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", 50))
@@ -154,60 +221,9 @@ if TTS_WORKERS > len(PHYSICAL_CORES):
 
 logger.info(f"Workers: TTS={TTS_WORKERS} (físicos), Mix={MIX_WORKERS}")
 
-
-#---------- Pré-carrega os efeitos
-EFFECTS_CACHE = {}
-def preload_effects():
-    """Carrega todos os efeitos disponíveis e os normaliza para mono, target_rate, PCM 16-bit."""
-    logger.info("Pré-carregando efeitos...")
-    target_rate = 22050
-    # Procura efeitos no diretório global
-    for effect_file in EFFECTS_DIR.glob("*.wav"):
-        effect_name = effect_file.name
-        try:
-            # Carrega com FFmpeg e normaliza
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(effect_file),
-                "-ar", str(target_rate),
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                "-f", "wav",
-                "pipe:1"
-            ]
-            result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
-            EFFECTS_CACHE[effect_name] = result.stdout
-            logger.info(f"Efeito pré-carregado: {effect_name}")
-        except Exception as e:
-            logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
-
-    # Também procura efeitos nas pastas das vozes
-    for voice_name, voice_data in VOICE_PATHS.items():
-        voice_dir = VOICES_DIR / voice_name
-        for effect_file in voice_dir.glob("*.wav"):
-            effect_name = effect_file.name
-            if effect_name in EFFECTS_CACHE:
-                continue
-            try:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", str(effect_file),
-                    "-ar", str(target_rate),
-                    "-ac", "1",
-                    "-c:a", "pcm_s16le",
-                    "-f", "wav",
-                    "pipe:1"
-                ]
-                result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
-                EFFECTS_CACHE[effect_name] = result.stdout
-                logger.info(f"Efeito pré-carregado (voz): {effect_name}")
-            except Exception as e:
-                logger.warning(f"Falha ao carregar efeito {effect_file}: {e}")
-
-    logger.info(f"Total de efeitos pré-carregados: {len(EFFECTS_CACHE)}")
-
-
-# ---------- Estatísticas dos workers ----------
+# ============================================================================
+# 10. ESTATÍSTICAS DOS WORKERS (COMPARTILHADAS)
+# ============================================================================
 manager = mp.Manager()
 worker_stats = manager.dict()
 worker_stats_lock = mp.Lock()
@@ -234,7 +250,9 @@ def update_worker_stats(worker_type, worker_id, request_time):
             data["avg_time"] = data["total_time"] / data["requests_processed"]
             worker_stats[key] = data
 
-# ---------- Inicializador TTS ----------
+# ============================================================================
+# 11. INICIALIZADORES DOS WORKERS
+# ============================================================================
 def _init_tts_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
@@ -261,7 +279,6 @@ def _init_tts_worker():
 
     logger.info(f"TTS Worker {worker_id} (PID {pid}) registrado no núcleo {cpu_id}")
 
-# ---------- Inicializador Mix ----------
 def _init_mix_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     ort.set_default_logger_severity(3)
@@ -299,13 +316,14 @@ def _init_mix_worker():
     pid = os.getpid()
     register_worker("mix", worker_id, pid, cpu_id, is_physical)
 
-# ---------- VoicePool (carrega o Piper normalmente) ----------
+# ============================================================================
+# 12. VOICEPOOL (CADA TTS WORKER TEM SEU PRÓPRIO POOL)
+# ============================================================================
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 1):
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
-            # O Piper agora cria a sessão via nosso monkey patch, que força intra_op_num_threads=1
             voice = PiperVoice.load(
                 model_path,
                 config_path=config_path,
@@ -319,13 +337,13 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
-# ---------- Registro de vozes ----------
+# ============================================================================
+# 13. REGISTRO DE VOZES
+# ============================================================================
 VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
-voices_metadata: Dict[str, dict] = {}
 
-def register_voice(voice_name, model_path, config_path, meta):
+def register_voice(voice_name, model_path, config_path):
     VOICE_PATHS[voice_name] = (model_path, config_path)
-    voices_metadata[voice_name] = meta
 
 def load_all_voices():
     for item in VOICES_DIR.iterdir():
@@ -343,30 +361,26 @@ def load_all_voices():
                     continue
                 json_path = json_candidates[0]
             config_path = str(json_path)
-            genero = "Desconhecido"
-            meta_path = item / f"{voice_name}.json"
-            if meta_path.exists():
-                try:
-                    with open(meta_path) as f:
-                        meta = json.load(f)
-                        genero = meta.get("genero", "Desconhecido")
-                except Exception:
-                    pass
-            register_voice(voice_name, model_path, config_path, {"genero": genero})
-            logger.info(f"Voz registrada: {voice_name} ({genero})")
+            register_voice(voice_name, model_path, config_path)
+            logger.info(f"Voz registrada: {voice_name}")
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         voice_name = onnx_file.stem
         if voice_name in VOICE_PATHS:
             continue
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
-            register_voice(voice_name, str(onnx_file), str(json_file), {"genero": "Personalizada"})
+            register_voice(voice_name, str(onnx_file), str(json_file))
             logger.info(f"Voz personalizada registrada: {voice_name}")
 
 load_all_voices()
-preload_effects()
 logger.info(f"Total de vozes disponíveis: {len(VOICE_PATHS)}")
 
+# Pré-carrega efeitos
+preload_effects()
+
+# ============================================================================
+# 14. FUNÇÕES DE SÍNTESE E MIXAGEM
+# ============================================================================
 def get_voice_pool(voice_name):
     mod = sys.modules['__main__']
     cache = getattr(mod, '_worker_voice_cache', None)
@@ -396,15 +410,13 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     finally:
         pool.put(voice)
 
-# ---------- Mixagem ----------
-def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
+def mix_and_export_task(segments_data, ambient_cfg, target_rate=TARGET_RATE):
     t0 = time.perf_counter()
     temp_files = []
 
     try:
         for data in segments_data:
             if 'pcm_bytes' in data:
-                # Segmento de fala (PCM já está no formato correto)
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     wav_path = f.name
                 with wave.open(wav_path, 'wb') as wav_file:
@@ -413,14 +425,18 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     wav_file.setframerate(data['sample_rate'])
                     wav_file.writeframes(data['pcm_bytes'])
                 temp_files.append(wav_path)
+                logger.debug(f"Segmento PCM: {wav_path}")
 
             elif 'effect' in data:
                 effect_file = data['effect']
-                # Verifica se o efeito está no cache
+                # Garante extensão .wav
+                if not effect_file.endswith('.wav'):
+                    effect_file = effect_file + '.wav'
+
                 if effect_file in EFFECTS_CACHE:
                     wav_bytes = EFFECTS_CACHE[effect_file]
                 else:
-                    # Fallback: tenta carregar do disco (pode acontecer se um efeito não foi pré-carregado)
+                    # Fallback: tenta carregar do disco
                     voice_dir = VOICES_DIR / data['voice']
                     effect_path = voice_dir / effect_file
                     if not effect_path.exists():
@@ -428,7 +444,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     if not effect_path.exists():
                         logger.warning(f"Efeito '{effect_file}' não encontrado, ignorando.")
                         continue
-                    # Carrega e normaliza na hora (mais lento, mas raro)
                     cmd = [
                         "ffmpeg", "-y",
                         "-i", str(effect_path),
@@ -441,15 +456,15 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     result = subprocess.run(cmd, capture_output=True, check=True, timeout=5)
                     wav_bytes = result.stdout
 
-                # Salva os bytes do efeito em um arquivo temporário
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     f.write(wav_bytes)
                     temp_files.append(f.name)
+                    logger.debug(f"Efeito: {f.name}")
 
         if not temp_files:
             raise ValueError("Nenhum arquivo para processar")
 
-        # Concatenação com demuxer concat (mais rápido)
+        # Concatenação
         if len(temp_files) == 1:
             with open(temp_files[0], 'rb') as f:
                 concat_bytes = f.read()
@@ -476,7 +491,6 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
         if ambient_cfg.get('enabled') and ambient_cfg.get('file'):
             ambient_path = AMBIENT_DIR / f"{ambient_cfg['file']}.wav"
             if ambient_path.exists():
-                # Prepara o ambiente
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     ambient_temp = f.name
                 subprocess.run([
@@ -488,12 +502,10 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
                     ambient_temp
                 ], capture_output=True, check=True, timeout=5)
 
-                # Salva concat_bytes em temporário
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     f.write(concat_bytes)
                     concat_temp = f.name
 
-                # Mixa
                 mix_cmd = [
                     "ffmpeg", "-y",
                     "-i", concat_temp,
@@ -543,7 +555,10 @@ def mix_and_export_task(segments_data, ambient_cfg, target_rate=22050):
             except:
                 pass
         raise
-# ---------- Processamento TTS ----------
+
+# ============================================================================
+# 15. PROCESSAMENTO TTS (GERA SEGMENTOS)
+# ============================================================================
 def process_tts_only(
     voice_name: Optional[str],
     text: str,
@@ -584,12 +599,17 @@ def process_tts_only(
                 current_role = role
             continue
 
+        # --- EFEITO ---
         if part in effects:
             effect_file = effects[part]
+            if not effect_file.endswith('.wav'):
+                effect_file = effect_file + '.wav'
             voice_for_eff = speaker_map[current_role][0] if is_dialog and current_role else voice_name
             segments.append({'effect': effect_file, 'voice': voice_for_eff})
+            logger.debug(f"Efeito adicionado: {effect_file}")
             continue
 
+        # --- FALA ---
         if is_dialog:
             if current_role is None:
                 raise ValueError("Nenhum speaker definido antes do texto. Use [papel] no início.")
@@ -604,6 +624,7 @@ def process_tts_only(
         sample_rate, pcm_bytes = synthesize_text(v_name, part, spd, ns, nw)
         synth_time_total += time.perf_counter() - t_synth_start
         segments.append({'pcm_bytes': pcm_bytes, 'sample_rate': sample_rate})
+        logger.debug(f"Fala adicionada: '{part[:30]}...'")
 
     total_worker_time = time.perf_counter() - t_worker_start
 
@@ -623,7 +644,9 @@ def process_tts_only(
 
     return segments, metrics
 
-# ---------- Pools ----------
+# ============================================================================
+# 16. POOLS DE PROCESSOS
+# ============================================================================
 tts_pool = ProcessPoolExecutor(
     max_workers=TTS_WORKERS,
     initializer=_init_tts_worker
@@ -635,7 +658,9 @@ mix_pool = ProcessPoolExecutor(
 
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
-# ---------- Modelos ----------
+# ============================================================================
+# 17. MODELOS PYDANTIC
+# ============================================================================
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -658,8 +683,10 @@ class TTSRequest(BaseModel):
     ambient: AmbientConfig = Field(default_factory=AmbientConfig)
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
-# ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (ONNX 1 Thread via Monkey Patch)")
+# ============================================================================
+# 18. FASTAPI APP
+# ============================================================================
+app = FastAPI(title="Piper TTS API (Otimizada)")
 
 stats = defaultdict(list)
 stats_lock = asyncio.Lock()
@@ -671,7 +698,9 @@ def json_response(data: Any, status_code: int = 200) -> JSONResponse:
         media_type="application/json"
     )
 
-# ---------- Endpoint principal ----------
+# ============================================================================
+# 19. ENDPOINT PRINCIPAL
+# ============================================================================
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     if request_semaphore:
@@ -717,7 +746,7 @@ async def synthesize(req: TTSRequest):
             mix_and_export_task,
             segments,
             ambient_dict,
-            22050
+            TARGET_RATE
         )
         wav_bytes, mix_time = await asyncio.wait_for(mix_future, timeout=REQUEST_TIMEOUT)
 
@@ -752,7 +781,9 @@ async def synthesize(req: TTSRequest):
         if request_semaphore:
             request_semaphore.release()
 
-# ---------- Endpoints de diagnóstico ----------
+# ============================================================================
+# 20. ENDPOINTS DE DIAGNÓSTICO
+# ============================================================================
 @app.get("/stats")
 async def get_stats():
     async with stats_lock:
@@ -832,7 +863,6 @@ async def reset_stats():
             worker_stats[key] = data
     return json_response({"message": "Estatísticas resetadas com sucesso."})
 
-# ---------- DIAGNÓSTICO COMPLETO ----------
 @app.get("/diagnose_cores")
 async def diagnose_cores():
     try:
@@ -932,7 +962,6 @@ async def diagnose_cores():
         logger.error(f"Erro no diagnose: {e}")
         return json_response({"error": str(e)}, status_code=500)
 
-# ---------- Definir cores físicos manualmente ----------
 class SetPhysicalCoresRequest(BaseModel):
     cores: List[int]
 
@@ -955,7 +984,9 @@ async def set_physical_cores(req: SetPhysicalCoresRequest):
         "note": "Os workers já existentes não serão afetados; novos workers usarão esta configuração."
     })
 
-# ---------- Endpoints de saúde ----------
+# ============================================================================
+# 21. ENDPOINTS DE SAÚDE
+# ============================================================================
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
@@ -982,6 +1013,9 @@ async def health():
         "timeout": REQUEST_TIMEOUT,
     })
 
+# ============================================================================
+# 22. PONTO DE ENTRADA
+# ============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
